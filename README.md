@@ -4,6 +4,15 @@
   <a href="#english"><b>🇬🇧 English</b></a> &nbsp;|&nbsp; <a href="#turkce"><b>🇹🇷 Türkçe</b></a>
 </p>
 
+<p align="center">
+  <a href="https://www.agensi.io/r/POYRAZYLDRMPHP">
+    <img src="https://img.shields.io/badge/Install_on-Agensi.io-2563EB?style=for-the-badge" alt="Install on Agensi.io" />
+  </a>
+  <a href="https://agensi.io/skills/sideloadly-windows-mcp-ios-ipa-signing-auto-refresh">
+    <img src="https://img.shields.io/badge/Verified_Agent_Skill-Live-16A34A?style=for-the-badge" alt="Verified Agent Skill" />
+  </a>
+</p>
+
 ---
 
 <a id="english"></a>
@@ -13,7 +22,7 @@ A production-ready **Model Context Protocol (MCP)** server that gives AI agents 
 
 It communicates directly with Sideloadly's internal **SQLite database (`installations.db`)**, **MD5 IPA cache (`%LOCALAPPDATA%\cache\sideloadly`)**, and **local HTTP IPC server (`127.0.0.1:28811`)**, with automatic path discovery, SQLite lock retries, cold-start IPC retries, and real-time installation completion tracking.
 
-> **Agent Skill Included:** Includes a ready-to-use [`SKILL.md`](./SKILL.md) following the open Agent Skills specification so AI agents know exactly when and how to diagnose, sign, install, and refresh iOS `.ipa` files.
+> **One-Click Agent Skill on Agensi.io:** Want the verified ready-to-install skill package for Claude Code, Cursor, Copilot, and 20+ AI agents? [**Get it on Agensi.io →**](https://www.agensi.io/r/POYRAZYLDRMPHP) ([view skill listing](https://agensi.io/skills/sideloadly-windows-mcp-ios-ipa-signing-auto-refresh))
 
 ### Features & Tools (14 MCP Tools)
 
@@ -96,7 +105,7 @@ Windows üzerinde **Sideloadly** uygulamasını yapay zeka ajanlarına (Claude C
 
 Kırılgan arayüz tıklama (GUI clicker) yöntemleri yerine doğrudan Sideloadly'nin kendi iç **SQLite veritabanı (`installations.db`)**, **MD5 IPA önbelleği (`%LOCALAPPDATA%\cache\sideloadly`)** ve **yerel HTTP IPC sunucusu (`127.0.0.1:28811`)** ile haberleşir. Otomatik kurulum dizini keşfi, SQLite kilitlenme koruması, soğuk başlangıç (cold-start) yeniden denemeleri ve gerçek zamanlı kurulum tamamlama takibi içerir.
 
-> **Agent Skill Dahil:** Açık Agent Skills standardına uygun [`SKILL.md`](./SKILL.md) dosyası paketle birlikte gelir; böylece yapay zeka ajanları iOS `.ipa` dosyalarını ne zaman ve nasıl teşhis edip imzalayacağını, kuracağını ve yenileyeceğini bilir.
+> **Agensi.io Üzerinden Tek Tıkla Kurulum:** Claude Code, Cursor, Copilot ve 20+ yapay zeka ajanı için doğrulanmış hazır skill paketini doğrudan kurmak için: [**Agensi.io'da İncele →**](https://www.agensi.io/r/POYRAZYLDRMPHP) ([skill sayfası](https://agensi.io/skills/sideloadly-windows-mcp-ios-ipa-signing-auto-refresh))
 
 ### Özellikler & Araçlar (14 MCP Aracı)
 
