@@ -1,54 +1,44 @@
 # Sideloadly Windows MCP Server (`sideloadly-mcp`)
 
-Windows üzerinde **Sideloadly** uygulamasını yapay zeka asistanlarına (Antigravity, Claude Desktop, Cursor, Windsurf vb.) bağlayan **Model Context Protocol (MCP)** sunucusudur.
+A production-ready **Model Context Protocol (MCP)** server that gives AI agents (Claude Code, Cursor, Windsurf, Copilot, Antigravity, and any MCP-compatible client) full programmatic control over **Sideloadly** on Windows — without fragile GUI clicking or screen scraping.
 
-Herhangi bir arayüz tıklama otomasyonuna (GUI clicker) ihtiyaç duymadan, doğrudan Sideloadly'nin kendi iç **SQLite veritabanı (`installations.db`)**, **MD5 IPA önbelleği (`cache/sideloadly`)** ve **yerel HTTP IPC sunucusu (`127.0.0.1:28811`)** ile haberleşir.
+It communicates directly with Sideloadly's internal **SQLite database (`installations.db`)**, **MD5 IPA cache (`%LOCALAPPDATA%\cache\sideloadly`)**, and **local HTTP IPC server (`127.0.0.1:28811`)**, with automatic path discovery, SQLite lock retries, cold-start IPC retries, and real-time installation completion tracking.
 
----
-
-## ✨ Özellikler & Araçlar (MCP Tools)
-
-1. **`sideloadly_doctor`**: Bilgisayardaki Sideloadly kurulumunu, Anisette DLL'lerini (`an/`), Apple ID oturumunu (`sessions.json`), bağlı cihazları ve `28811` IPC portunu kontrol eder. Yeni bilgisayarlarda eksik adımları raporlar.
-2. **`list_devices`**: Sideloadly'ye kayıtlı tüm iPhone, iPad, Apple TV ve M1 Mac cihazları listeler.
-3. **`list_installations`**: Kurulu uygulamaları, Bundle ID'lerini, 7 günlük imzalama süresinden kalan saatleri (`hours_left`), önbellekteki `.ipa` dosyalarını ve varsa son hata kodlarını (`last_error`) listeler.
-4. **`get_apple_id_quota`**: Ücretsiz Apple geliştirici hesabında kalan App ID hakkını (`Remaining`) ve en yakın sıfırlanma zamanını (`NearestTtl`) gösterir.
-5. **`inspect_ipa`**: Bilgisayardaki herhangi bir `.ipa` dosyasının içindeki `Payload/*.app/Info.plist` dosyasını okuyarak Bundle ID, versiyon, minimum iOS sürümü, PlugIns ve Frameworks listesini çıkarır.
-6. **`trigger_refresh`**: Kurulu bir uygulamayı (`installation_id` veya uygulama adı / Bundle ID ile) veritabanında kuyruğa sokar ve `http://127.0.0.1:28811/enqueue?id=<id>` üzerinden Sideloadly'ye anında yeniletir (Re-sign & Install).
-7. **`install_or_update_ipa`**: Bilgisayardaki yeni bir `.ipa` dosyasını MD5 hash'i ile Sideloadly önbelleğine kopyalar, `stored_files` ve `installations` tablolarına kaydeder ve arka planda otomatik kurulumu başlatır.
-8. **`get_device_installed_apps`**: Cihazda kurulu olan tüm kullanıcı uygulamalarını (`sideloadlydaemon.log` üzerinden) filtreleyerek listeler.
-9. **`get_daemon_logs`**: Arka plan servisinin (`sideloadlydaemon.log`) son loglarını okur.
-10. **`get_sideloadly_options` / `set_sideloadly_option`**: Sideloadly ayarlarını (`anisette-mode`, `zipstream`, `ignore-preflight`, `custom-chunk-size`) okur ve günceller.
-11. **`control_sideloadly`**: Sideloadly arayüzünü öne getirme (`raise`), `.ipa` dosyasını arayüzde açma, arka planda sessiz başlatma (`start_silent`) veya yeniden başlatma (`restart_gui`) işlemlerini yapar.
+> **Agent Skill Included:** Includes a ready-to-use [`SKILL.md`](./SKILL.md) following the open Agent Skills specification so AI agents know exactly when and how to diagnose, sign, install, and refresh iOS `.ipa` files.
 
 ---
 
-## 🚀 Yeni Bir Bilgisayarda Kurulum
+## Features & Tools (14 MCP Tools)
 
-### 1. Ön Gereksinimler
-- Windows üzerinde **Sideloadly** kurulu olmalıdır.
-- iTunes ve iCloud (Microsoft Store olmayan Apple web sürümleri) kurulu olmalıdır.
-- Sideloadly arayüzünden **1 kez Apple ID ile giriş yapılmış** ve iOS cihaz kablo ile bağlanıp **"Bu Bilgisayara Güven"** denmiş olmalıdır.
+| Tool | Description |
+| :--- | :--- |
+| `sideloadly_doctor` | Full environment health check (Sideloadly paths, Anisette DLLs, Apple ID session, paired devices, IPC port `28811`). |
+| `list_devices` | List all registered iPhone/iPad/Apple TV devices and active installation counts. |
+| `list_installations` | List all Sideloadly installations with 7-day expiration countdown (`hours_left`), cached IPA status, and errors. |
+| `get_installation_status` | Poll the live status of a single installation by ID (ideal when `wait_for_completion=False`). |
+| `get_apple_id_quota` | Check remaining 7-day free Apple ID App ID quota (`Remaining`), nearest reset (`NearestTtl`), and certificates. |
+| `inspect_ipa` | Parse any `.ipa` file's `Payload/*.app/Info.plist` (Bundle ID, Display Name, Version, Minimum iOS, PlugIns, Frameworks). |
+| `install_or_update_ipa` | Hash `.ipa` (MD5), copy to Sideloadly cache, upsert DB records, enqueue via IPC with retries, and wait for completion. |
+| `trigger_refresh` | Immediately re-sign and reinstall an existing app by `installation_id`, app name, or Bundle ID. |
+| `cancel_queue` | Clear pending or stuck enqueued tasks from `installations.db`. |
+| `get_device_installed_apps` | List user-installed apps detected on the connected iOS/iPadOS device with optional search filtering. |
+| `get_daemon_logs` | Read the latest lines from `sideloadlydaemon.log`. |
+| `get_sideloadly_options` | Read Sideloadly option flags (`anisette-mode`, `zipstream`, `ignore-preflight`, `custom-chunk-size`). |
+| `set_sideloadly_option` | Update a Sideloadly option flag safely. |
+| `control_sideloadly` | Control Sideloadly processes: `status`, `raise`, `start_gui`, `start_silent`, `start_daemon`, `restart_gui`. |
 
-### 2. Paketi Kurma
+---
 
-```powershell
-pip install git+https://github.com/DarkMirrorq/sideloadly-mcp.git
-```
+## Quick Start (Any Windows PC)
 
-### 3. MCP Yapılandırması (`mcp_config.json`)
+### 1. Prerequisites
+- **Windows 10/11** with **Sideloadly** installed.
+- **iTunes & iCloud** (Apple web versions, not Microsoft Store) installed as required by Sideloadly.
+- Sign into your Apple ID inside Sideloadly GUI **once**, and connect your iOS/iPadOS device via USB (**Trust This Computer**).
 
-**Seçenek A — `pip` ile kurulum sonrası:**
-```json
-{
-  "mcpServers": {
-    "sideloadly": {
-      "command": "sideloadly-mcp"
-    }
-  }
-}
-```
+### 2. Configure in Your AI Agent (`mcp_config.json`)
 
-**Seçenek B — `uvx` ile sıfır kurulumla (önerilen):**
+**Option A — Zero-install via `uvx` (Recommended):**
 ```json
 {
   "mcpServers": {
@@ -63,3 +53,40 @@ pip install git+https://github.com/DarkMirrorq/sideloadly-mcp.git
   }
 }
 ```
+
+**Option B — Install via `pip`:**
+```powershell
+pip install git+https://github.com/DarkMirrorq/sideloadly-mcp.git
+```
+```json
+{
+  "mcpServers": {
+    "sideloadly": {
+      "command": "sideloadly-mcp"
+    }
+  }
+}
+```
+
+### 3. Custom Sideloadly Install Path (Optional)
+`sideloadly-mcp` automatically discovers Sideloadly via `%LOCALAPPDATA%\Sideloadly`, `Program Files`, Windows Registry (`sideloadly:` URI handler), and running processes. If you use a portable/custom folder, set `SIDELOADLY_DIR` in your MCP `env`:
+
+```json
+"env": {
+  "SIDELOADLY_DIR": "D:\\Apps\\Sideloadly"
+}
+```
+
+---
+
+## Running Tests
+
+```powershell
+python -m unittest discover -s tests -v
+```
+
+---
+
+## License
+
+MIT License — see [LICENSE](./LICENSE).

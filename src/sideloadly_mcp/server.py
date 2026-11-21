@@ -1,11 +1,13 @@
-"""Sideloadly Windows MCP Server.
+"""Sideloadly Windows MCP Server (v0.2.0).
 
 Provides full programmatic control over Sideloadly on Windows:
-- Auto-discovers Sideloadly installation, database, cache, and roaming directories
-- Reads and manages iOS/iPadOS devices, installations, Apple ID App ID quotas
-- Enqueues app refreshes and new IPA installations via Sideloadly's internal SQLite DB + localhost:28811 IPC API
+- Auto-discovers Sideloadly installation (env var, standard paths, Windows Registry, running process),
+  SQLite database, MD5 IPA cache, and roaming session directories
+- Reads and manages iOS/iPadOS devices, installations, Apple ID App ID quotas, and options
+- Enqueues app refreshes and new/updated IPA installations via Sideloadly's SQLite DB + localhost:28811 IPC API
+  with cold-start retries, SQLite lock handling, and accurate completion/error tracking
 - Parses IPA Info.plist metadata automatically
-- Manages Sideloadly GUI / Daemon processes, options, and logs
+- Manages Sideloadly GUI / Daemon processes, stuck queues, and daemon logs
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ import subprocess
 import time
 import zipfile
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional, TypeVar
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -33,15 +35,69 @@ mcp = FastMCP("sideloadly")
 IPC_BASE_URL = "http://127.0.0.1:28811"
 ZERO_TIME = "0001-01-01 00:00:00+00:00"
 
+T = TypeVar("T")
+
+
+def _discover_sideloadly_dir_from_registry() -> Optional[Path]:
+    """Attempt to locate Sideloadly installation directory from Windows Registry."""
+    if os.name != "nt":
+        return None
+    try:
+        import winreg
+
+        registry_paths = [
+            (winreg.HKEY_CURRENT_USER, r"Software\Classes\sideloadly\shell\open\command"),
+            (winreg.HKEY_LOCAL_MACHINE, r"Software\Classes\sideloadly\shell\open\command"),
+        ]
+        for hive, subkey in registry_paths:
+            try:
+                with winreg.OpenKey(hive, subkey) as key:
+                    val, _ = winreg.QueryValueEx(key, "")
+                    if isinstance(val, str):
+                        m = re.search(r'"?([A-Za-z]:\\[^"]*?sideloadly\.exe)"?', val, re.IGNORECASE)
+                        if m:
+                            exe_path = Path(m.group(1))
+                            if exe_path.exists():
+                                return exe_path.parent
+            except OSError:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def _discover_sideloadly_dir_from_process() -> Optional[Path]:
+    """Attempt to locate Sideloadly directory from a currently running process on Windows."""
+    if os.name != "nt":
+        return None
+    try:
+        cmd = (
+            "Get-Process -Name sideloadly,sideloadlydaemon -ErrorAction SilentlyContinue "
+            "| Select-Object -First 1 -ExpandProperty Path"
+        )
+        out = subprocess.check_output(
+            ["powershell", "-NoProfile", "-Command", cmd],
+            text=True,
+            timeout=4,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        ).strip()
+        if out:
+            p = Path(out)
+            if p.exists():
+                return p.parent
+    except Exception:
+        pass
+    return None
+
 
 class SideloadlyPaths:
     """Dynamically resolves Sideloadly paths on any Windows machine."""
 
     def __init__(self) -> None:
+        self.is_windows = os.name == "nt"
         local_app_data = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
         roaming_app_data = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
 
-        # Check environment override or standard locations
         custom_dir = os.environ.get("SIDELOADLY_DIR")
         if custom_dir and Path(custom_dir).exists():
             self.local_dir = Path(custom_dir)
@@ -51,7 +107,14 @@ class SideloadlyPaths:
                 Path("C:/Program Files/Sideloadly"),
                 Path("C:/Program Files (x86)/Sideloadly"),
             ]
-            self.local_dir = next((p for p in candidates if p.exists()), local_app_data / "Sideloadly")
+            found = next((p for p in candidates if (p / "sideloadly.exe").exists() or (p / "installations.db").exists()), None)
+            if found is None:
+                found = next((p for p in candidates if p.exists()), None)
+            if found is None:
+                found = _discover_sideloadly_dir_from_registry()
+            if found is None:
+                found = _discover_sideloadly_dir_from_process()
+            self.local_dir = found if found is not None else (local_app_data / "Sideloadly")
 
         self.roaming_dir = roaming_app_data / "Sideloadly"
         self.cache_dir = local_app_data / "cache" / "sideloadly"
@@ -70,27 +133,68 @@ def get_paths() -> SideloadlyPaths:
     return SideloadlyPaths()
 
 
+def _check_platform_error() -> Optional[dict[str, Any]]:
+    if os.name != "nt" and not os.environ.get("SIDELOADLY_ALLOW_NON_WINDOWS"):
+        return {
+            "error": "Sideloadly MCP currently supports Windows only (detected non-Windows OS).",
+            "platform": os.name,
+        }
+    return None
+
+
 def get_db_connection(readonly: bool = False) -> sqlite3.Connection:
     paths = get_paths()
     if not paths.db_path.exists():
-        raise FileNotFoundError(f"Sideloadly database not found at {paths.db_path}")
+        raise FileNotFoundError(
+            f"Sideloadly database not found at {paths.db_path}. "
+            "Open Sideloadly at least once so it initializes installations.db."
+        )
     if readonly:
         uri = f"file:{paths.db_path.as_posix()}?mode=ro"
-        conn = sqlite3.connect(uri, uri=True, timeout=10.0)
+        conn = sqlite3.connect(uri, uri=True, timeout=15.0)
     else:
-        conn = sqlite3.connect(str(paths.db_path), timeout=10.0)
+        conn = sqlite3.connect(str(paths.db_path), timeout=15.0)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _run_db_with_retry(fn: Callable[[sqlite3.Connection], T], readonly: bool = False, retries: int = 5) -> T:
+    """Execute a SQLite operation with automatic retry on transient lock/busy errors, always closing the handle."""
+    last_err: Optional[Exception] = None
+    for attempt in range(1, retries + 1):
+        conn: Optional[sqlite3.Connection] = None
+        try:
+            conn = get_db_connection(readonly=readonly)
+            return fn(conn)
+        except sqlite3.OperationalError as e:
+            msg = str(e).lower()
+            if ("locked" in msg or "busy" in msg) and attempt < retries:
+                last_err = e
+                time.sleep(0.25 * attempt)
+                continue
+            raise
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    if last_err:
+        raise last_err
+    raise RuntimeError("Unexpected SQLite retry exit")
 
 
 def get_running_processes() -> dict[str, list[int]]:
     """Return PIDs for sideloadly.exe and sideloadlydaemon.exe."""
     result: dict[str, list[int]] = {"sideloadly.exe": [], "sideloadlydaemon.exe": []}
+    if os.name != "nt":
+        return result
     try:
         output = subprocess.check_output(
             ["tasklist", "/FI", "IMAGENAME eq sideloadly*", "/FO", "CSV", "/NH"],
             text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            timeout=5,
+            creationflags=subprocess.CREATE_NO_WINDOW,
         )
         for line in output.strip().splitlines():
             parts = [p.strip('"') for p in line.split('","')]
@@ -112,31 +216,38 @@ def check_ipc_alive() -> bool:
         return False
 
 
-def ensure_sideloadly_running(wait_seconds: float = 8.0) -> dict[str, Any]:
-    """Ensure sideloadly.exe is running and listening on port 28811."""
+def ensure_sideloadly_running(mode: str = "enqueue", wait_seconds: float = 10.0) -> dict[str, Any]:
+    """Ensure sideloadly.exe is running and listening on port 28811.
+
+    Args:
+        mode: 'enqueue' launches `sideloadly.exe --silent ENQUEUE` (headless background processing).
+              'gui' launches `sideloadly.exe` normally so the window stays open.
+    """
     if check_ipc_alive():
-        return {"running": True, "started_now": False}
+        return {"running": True, "started_now": False, "mode": mode}
 
     paths = get_paths()
     if not paths.exe_path.exists():
         return {"running": False, "error": f"sideloadly.exe not found at {paths.exe_path}"}
 
+    args = [str(paths.exe_path), "--silent", "ENQUEUE"] if mode == "enqueue" else [str(paths.exe_path)]
     subprocess.Popen(
-        [str(paths.exe_path), "--silent", "ENQUEUE"],
+        args,
         cwd=str(paths.local_dir),
         creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
     )
     deadline = time.time() + wait_seconds
     while time.time() < deadline:
         if check_ipc_alive():
-            return {"running": True, "started_now": True}
+            return {"running": True, "started_now": True, "mode": mode}
         time.sleep(0.5)
 
-    return {"running": False, "started_now": True, "error": "Timed out waiting for IPC port 28811"}
+    return {"running": False, "started_now": True, "mode": mode, "error": "Timed out waiting for IPC port 28811"}
 
 
 def enqueue_via_ipc(
     ins_id: int,
+    before_state: Optional[dict[str, Any]] = None,
     wait_for_completion: bool = True,
     timeout_seconds: float = 240.0,
 ) -> dict[str, Any]:
@@ -144,14 +255,28 @@ def enqueue_via_ipc(
 
     Sideloadly's IPC port can accept connections before its queue is ready (right after a cold start),
     in which case /enqueue answers 'Task enqueue fail'. We retry until it answers 'Task enqueued'.
-    Completion is detected when installations.last_updated changes (success) or last_error is set (failure).
+    Completion is detected when:
+      - `last_updated` changes (installed)
+      - `failures_count` increases, `last_failure_at` changes, or a new non-empty `last_error` appears (failed)
+      - `enqueued_at` is cleared back to zero without an update or error (cleared_without_update)
     """
-    proc_status = ensure_sideloadly_running()
+    proc_status = ensure_sideloadly_running(mode="enqueue")
     result: dict[str, Any] = {"sideloadly_process": proc_status, "enqueued": False}
 
-    with get_db_connection(readonly=True) as conn:
-        row = conn.execute("SELECT last_updated FROM installations WHERE id = ?", (ins_id,)).fetchone()
-        before_updated = row["last_updated"] if row else None
+    if before_state is None:
+        def _read_before(conn: sqlite3.Connection) -> dict[str, Any]:
+            r = conn.execute(
+                "SELECT last_updated, last_error, failures_count, last_failure_at FROM installations WHERE id = ?",
+                (ins_id,),
+            ).fetchone()
+            return dict(r) if r else {}
+
+        before_state = _run_db_with_retry(_read_before, readonly=True)
+
+    before_updated = before_state.get("last_updated")
+    before_error = before_state.get("last_error") or ""
+    before_failures = before_state.get("failures_count") or 0
+    before_failure_at = before_state.get("last_failure_at") or ZERO_TIME
 
     last_text = ""
     last_code = None
@@ -165,7 +290,7 @@ def enqueue_via_ipc(
         if last_text.startswith("Task enqueued"):
             result["enqueued"] = True
             break
-        time.sleep(2.0 * attempt)
+        time.sleep(min(2.0 * attempt, 8.0))
 
     result.update({"ipc_status_code": last_code, "ipc_response": last_text})
     if not result["enqueued"] or not wait_for_completion:
@@ -174,19 +299,49 @@ def enqueue_via_ipc(
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
         time.sleep(3.0)
-        with get_db_connection(readonly=True) as conn:
-            row = conn.execute(
-                "SELECT last_updated, last_error, failures_count FROM installations WHERE id = ?",
+
+        def _poll(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
+            r = conn.execute(
+                "SELECT last_updated, last_error, failures_count, last_failure_at, enqueued_at, enqueue_token "
+                "FROM installations WHERE id = ?",
                 (ins_id,),
             ).fetchone()
+            return dict(r) if r else None
+
+        row = _run_db_with_retry(_poll, readonly=True)
         if not row:
             break
+
         if row["last_updated"] != before_updated:
             result.update({"completed": True, "status": "installed", "last_updated": row["last_updated"]})
             return result
-        if row["last_error"]:
-            result.update({"completed": True, "status": "failed", "last_error": row["last_error"]})
+
+        cur_failures = row["failures_count"] or 0
+        cur_failure_at = row["last_failure_at"] or ZERO_TIME
+        cur_error = row["last_error"] or ""
+        new_failure = (
+            cur_failures > before_failures
+            or cur_failure_at != before_failure_at
+            or (cur_error != "" and cur_error != before_error)
+        )
+        if new_failure:
+            result.update(
+                {
+                    "completed": True,
+                    "status": "failed",
+                    "last_error": cur_error,
+                    "failures_count": cur_failures,
+                    "last_failure_at": cur_failure_at,
+                }
+            )
             return result
+
+        enq_at = str(row.get("enqueued_at") or "")
+        enq_tok = row.get("enqueue_token") or ""
+        if enq_at.startswith("0001-01-01") and not enq_tok:
+            result.update({"completed": False, "status": "cleared_without_update"})
+            return result
+
     result.update({"completed": False, "status": "timeout_waiting_for_install"})
     return result
 
@@ -195,7 +350,6 @@ def parse_iso_datetime(val: Optional[str]) -> Optional[datetime.datetime]:
     if not val or val.startswith("0001-01-01"):
         return None
     try:
-        # Handle Go nanosecond timestamps like '2026-11-20 21:22:13.0204277+03:00'
         cleaned = re.sub(r"\.(\d{6})\d+", r".\1", val.strip())
         return datetime.datetime.fromisoformat(cleaned)
     except Exception:
@@ -205,6 +359,92 @@ def parse_iso_datetime(val: Optional[str]) -> Optional[datetime.datetime]:
 def now_go_iso() -> str:
     """Format current local time in Go/SQLite ISO format with timezone."""
     return datetime.datetime.now().astimezone().isoformat(sep=" ")
+
+
+def _discover_accounts(paths: SideloadlyPaths) -> list[str]:
+    """Discover configured Apple IDs from account-appids.json, cert-*.pem, and sessions.json."""
+    accounts: list[str] = []
+    if paths.account_appids_path.exists():
+        try:
+            data = json.loads(paths.account_appids_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                for k in data.keys():
+                    if k and k not in accounts:
+                        accounts.append(k)
+        except Exception:
+            pass
+
+    if paths.roaming_dir.exists():
+        for c in paths.roaming_dir.glob("cert-*.pem"):
+            email = c.name.removeprefix("cert-").removesuffix(".pem")
+            if email and email not in accounts:
+                accounts.append(email)
+
+    if paths.sessions_path.exists():
+        try:
+            sdata = json.loads(paths.sessions_path.read_text(encoding="utf-8"))
+            if isinstance(sdata, dict):
+                for k in sdata.keys():
+                    if isinstance(k, str) and "@" in k:
+                        email = k.split(":", 1)[0].strip()
+                        if email and email not in accounts:
+                            accounts.append(email)
+        except Exception:
+            pass
+
+    return accounts
+
+
+def _discover_device_udid_from_log(paths: SideloadlyPaths) -> Optional[str]:
+    if not paths.daemon_log_path.exists():
+        return None
+    try:
+        text = paths.daemon_log_path.read_text(encoding="utf-8", errors="replace")
+        matches = list(re.finditer(r"Installed apps on ([0-9A-Za-z-]+):", text))
+        if matches:
+            return matches[-1].group(1)
+    except Exception:
+        pass
+    return None
+
+
+def _read_anisette_mode(paths: SideloadlyPaths, fallback: int = 2) -> int:
+    opt = paths.local_dir / "option-anisette-mode"
+    if opt.exists():
+        try:
+            return int(opt.read_text(encoding="utf-8").strip())
+        except Exception:
+            pass
+    return fallback
+
+
+def _enrich_installation_row(row: dict[str, Any], paths: SideloadlyPaths, now: datetime.datetime) -> dict[str, Any]:
+    item = dict(row)
+    last_upd = parse_iso_datetime(item.get("last_updated"))
+    ttl_days = item.get("known_ttl") or 7
+    if last_upd:
+        expires_at = last_upd + datetime.timedelta(days=ttl_days)
+        hours_left = round((expires_at - now).total_seconds() / 3600.0, 1)
+        item["expires_at"] = expires_at.isoformat()
+        item["hours_left"] = hours_left
+        item["is_expired"] = hours_left <= 0
+        item["needs_refresh"] = hours_left < (item.get("refresh_at_hours") or 96)
+    else:
+        item["expires_at"] = None
+        item["hours_left"] = None
+        item["is_expired"] = None
+        item["needs_refresh"] = True
+
+    enq_at = item.get("enqueued_at")
+    item["is_enqueued"] = bool(
+        enq_at and not str(enq_at).startswith("0001-01-01") and item.get("enqueue_token")
+    )
+    cached_name = item.get("cached_ipa_filename")
+    if cached_name:
+        cached_full = paths.cache_dir / cached_name
+        item["cached_ipa_path"] = str(cached_full)
+        item["cached_ipa_exists"] = cached_full.exists()
+    return item
 
 
 def inspect_ipa_metadata(ipa_path: Path) -> dict[str, Any]:
@@ -262,40 +502,33 @@ def sideloadly_doctor() -> dict[str, Any]:
     """Run a comprehensive health and environment check for Sideloadly on this Windows PC.
     Works on any newly configured machine to verify paths, processes, IPC port, Apple ID session, and Anisette libraries.
     """
+    plat_err = _check_platform_error()
+    if plat_err:
+        return {"healthy": False, **plat_err}
+
     paths = get_paths()
     procs = get_running_processes()
     ipc_ok = check_ipc_alive()
 
     anisette_dlls = list(paths.anisette_dir.glob("*.dll")) if paths.anisette_dir.exists() else []
-    certs = list(paths.roaming_dir.glob("cert-*.pem")) if paths.roaming_dir.exists() else []
-
-    accounts: list[str] = []
-    if paths.account_appids_path.exists():
-        try:
-            data = json.loads(paths.account_appids_path.read_text(encoding="utf-8"))
-            accounts.extend(data.keys())
-        except Exception:
-            pass
-    for c in certs:
-        email = c.name.removeprefix("cert-").removesuffix(".pem")
-        if email not in accounts:
-            accounts.append(email)
+    accounts = _discover_accounts(paths)
 
     device_count = 0
     installation_count = 0
     if paths.db_path.exists():
         try:
-            with get_db_connection(readonly=True) as conn:
-                device_count = conn.execute("SELECT COUNT(*) FROM devices").fetchone()[0]
-                installation_count = conn.execute(
-                    "SELECT COUNT(*) FROM installations WHERE deleted_at IS NULL"
-                ).fetchone()[0]
+            def _counts(conn: sqlite3.Connection) -> tuple[int, int]:
+                dc = conn.execute("SELECT COUNT(*) FROM devices").fetchone()[0]
+                ic = conn.execute("SELECT COUNT(*) FROM installations WHERE deleted_at IS NULL").fetchone()[0]
+                return dc, ic
+
+            device_count, installation_count = _run_db_with_retry(_counts, readonly=True)
         except Exception:
             pass
 
     issues: list[str] = []
     if not paths.exe_path.exists():
-        issues.append(f"Sideloadly executable not found at {paths.exe_path}. Install Sideloadly first.")
+        issues.append(f"Sideloadly executable not found at {paths.exe_path}. Install Sideloadly or set SIDELOADLY_DIR.")
     if not anisette_dlls:
         issues.append("Local Anisette DLLs ('an' folder) not found. Open Sideloadly once to download Anisette libraries.")
     if not accounts and not paths.sessions_path.exists():
@@ -328,22 +561,35 @@ def sideloadly_doctor() -> dict[str, Any]:
 @mcp.tool()
 def list_devices() -> dict[str, Any]:
     """List all iOS/iPadOS/tvOS/Mac devices registered in Sideloadly along with their installation counts and status."""
-    with get_db_connection(readonly=True) as conn:
-        devices = [dict(r) for r in conn.execute("SELECT * FROM devices").fetchall()]
-        for d in devices:
-            count = conn.execute(
-                "SELECT COUNT(*) FROM installations WHERE device_udid = ? AND deleted_at IS NULL",
-                (d["udid"],),
-            ).fetchone()[0]
-            d["active_installations_count"] = count
-            d["is_m1"] = bool(d.get("is_m1"))
-            d["is_tv"] = bool(d.get("is_tv"))
-    return {"count": len(devices), "devices": devices}
+    plat_err = _check_platform_error()
+    if plat_err:
+        return plat_err
+    try:
+        def _query(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            devices = [dict(r) for r in conn.execute("SELECT * FROM devices").fetchall()]
+            for d in devices:
+                count = conn.execute(
+                    "SELECT COUNT(*) FROM installations WHERE device_udid = ? AND deleted_at IS NULL",
+                    (d["udid"],),
+                ).fetchone()[0]
+                d["active_installations_count"] = count
+                d["is_m1"] = bool(d.get("is_m1"))
+                d["is_tv"] = bool(d.get("is_tv"))
+            return devices
+
+        devices = _run_db_with_retry(_query, readonly=True)
+        return {"count": len(devices), "devices": devices}
+    except FileNotFoundError as e:
+        return {"count": 0, "devices": [], "error": str(e)}
 
 
 @mcp.tool()
 def list_installations(device_udid: Optional[str] = None) -> dict[str, Any]:
     """List all Sideloadly app installations, including expiration countdown, cached IPA details, bundle IDs, and error status."""
+    plat_err = _check_platform_error()
+    if plat_err:
+        return plat_err
+
     query = """
         SELECT
             i.*,
@@ -365,44 +611,63 @@ def list_installations(device_udid: Optional[str] = None) -> dict[str, Any]:
 
     paths = get_paths()
     now = datetime.datetime.now().astimezone()
-    items: list[dict[str, Any]] = []
 
-    with get_db_connection(readonly=True) as conn:
-        rows = conn.execute(query, params).fetchall()
-        for r in rows:
-            item = dict(r)
-            last_upd = parse_iso_datetime(item.get("last_updated"))
-            ttl_days = item.get("known_ttl") or 7
-            if last_upd:
-                expires_at = last_upd + datetime.timedelta(days=ttl_days)
-                hours_left = round((expires_at - now).total_seconds() / 3600.0, 1)
-                item["expires_at"] = expires_at.isoformat()
-                item["hours_left"] = hours_left
-                item["is_expired"] = hours_left <= 0
-                item["needs_refresh"] = hours_left < (item.get("refresh_at_hours") or 96)
-            else:
-                item["expires_at"] = None
-                item["hours_left"] = None
-                item["is_expired"] = None
-                item["needs_refresh"] = True
+    try:
+        def _query(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+            rows = conn.execute(query, params).fetchall()
+            return [_enrich_installation_row(dict(r), paths, now) for r in rows]
 
-            enq_at = item.get("enqueued_at")
-            item["is_enqueued"] = bool(
-                enq_at and not str(enq_at).startswith("0001-01-01") and item.get("enqueue_token")
-            )
-            cached_name = item.get("cached_ipa_filename")
-            if cached_name:
-                cached_full = paths.cache_dir / cached_name
-                item["cached_ipa_path"] = str(cached_full)
-                item["cached_ipa_exists"] = cached_full.exists()
-            items.append(item)
+        items = _run_db_with_retry(_query, readonly=True)
+        return {"count": len(items), "installations": items}
+    except FileNotFoundError as e:
+        return {"count": 0, "installations": [], "error": str(e)}
 
-    return {"count": len(items), "installations": items}
+
+@mcp.tool()
+def get_installation_status(installation_id: int) -> dict[str, Any]:
+    """Get live status of a single Sideloadly installation (useful for polling after wait_for_completion=False)."""
+    plat_err = _check_platform_error()
+    if plat_err:
+        return plat_err
+
+    paths = get_paths()
+    now = datetime.datetime.now().astimezone()
+
+    try:
+        def _query(conn: sqlite3.Connection) -> Optional[dict[str, Any]]:
+            row = conn.execute(
+                """
+                SELECT
+                    i.*,
+                    d.name AS device_name,
+                    sf.stored_name AS cached_ipa_filename,
+                    sf.nickname AS original_ipa_name,
+                    sf.size AS ipa_size_bytes,
+                    sf.uncached_path AS ipa_uncached_path
+                FROM installations i
+                LEFT JOIN devices d ON d.udid = i.device_udid
+                LEFT JOIN stored_files sf ON sf.id = i.ipa_id
+                WHERE i.id = ? AND i.deleted_at IS NULL
+                """,
+                (installation_id,),
+            ).fetchone()
+            return _enrich_installation_row(dict(row), paths, now) if row else None
+
+        item = _run_db_with_retry(_query, readonly=True)
+        if not item:
+            return {"found": False, "installation_id": installation_id, "error": "Installation not found"}
+        return {"found": True, "installation": item}
+    except FileNotFoundError as e:
+        return {"found": False, "installation_id": installation_id, "error": str(e)}
 
 
 @mcp.tool()
 def get_apple_id_quota() -> dict[str, Any]:
     """Get Apple ID remaining App ID quota (10 per 7 days on free accounts), nearest expiration date, and certificate files."""
+    plat_err = _check_platform_error()
+    if plat_err:
+        return plat_err
+
     paths = get_paths()
     quotas: dict[str, Any] = {}
     if paths.account_appids_path.exists():
@@ -425,6 +690,7 @@ def get_apple_id_quota() -> dict[str, Any]:
     return {
         "quotas": quotas,
         "certificates": certs,
+        "discovered_apple_ids": _discover_accounts(paths),
         "sessions_file_exists": paths.sessions_path.exists(),
     }
 
@@ -450,6 +716,7 @@ def set_sideloadly_option(option_name: str, value: str) -> dict[str, Any]:
     if not re.match(r"^[a-z0-9-]+$", clean_name):
         raise ValueError(f"Invalid option name: {option_name}")
     paths = get_paths()
+    paths.local_dir.mkdir(parents=True, exist_ok=True)
     opt_path = paths.local_dir / f"option-{clean_name}"
     opt_path.write_text(str(value).strip(), encoding="utf-8")
     return {"option": clean_name, "value": str(value).strip(), "path": str(opt_path)}
@@ -471,10 +738,14 @@ def trigger_refresh(
     """Enqueue an existing Sideloadly installation for immediate re-signing and installation on the target iOS device.
     You can specify either `installation_id` or `app_name_or_bundle_id` (e.g., 'Luma Portal' or 'com.luma.portal').
     """
+    plat_err = _check_platform_error()
+    if plat_err:
+        return plat_err
+
     if installation_id is None and not app_name_or_bundle_id:
         raise ValueError("Provide either installation_id or app_name_or_bundle_id.")
 
-    with get_db_connection(readonly=False) as conn:
+    def _enqueue_db(conn: sqlite3.Connection) -> tuple[dict[str, Any], dict[str, Any], str]:
         if installation_id is not None:
             row = conn.execute(
                 "SELECT * FROM installations WHERE id = ? AND deleted_at IS NULL",
@@ -495,6 +766,13 @@ def trigger_refresh(
             raise LookupError("Matching installation not found in installations.db")
 
         ins = dict(row)
+        before_state = {
+            "last_updated": ins.get("last_updated"),
+            "last_error": "" if clear_errors else (ins.get("last_error") or ""),
+            "failures_count": 0 if clear_errors else (ins.get("failures_count") or 0),
+            "last_failure_at": ins.get("last_failure_at") or ZERO_TIME,
+        }
+
         ins_id = ins["id"]
         token = secrets.token_hex(16)
         now_str = now_go_iso()
@@ -518,8 +796,12 @@ def trigger_refresh(
                 (now_str, token, now_str, ins_id),
             )
         conn.commit()
+        return ins, before_state, token
 
-    outcome = enqueue_via_ipc(ins_id, wait_for_completion=wait_for_completion)
+    ins, before_state, token = _run_db_with_retry(_enqueue_db, readonly=False)
+    ins_id = ins["id"]
+
+    outcome = enqueue_via_ipc(ins_id, before_state=before_state, wait_for_completion=wait_for_completion)
     return {
         "installation_id": ins_id,
         "app_name": ins["name"],
@@ -545,14 +827,18 @@ def install_or_update_ipa(
 
     - Automatically hashes the .ipa (MD5), copies it into Sideloadly's cache directory (`%LOCALAPPDATA%\\cache\\sideloadly\\<md5>.ipa`),
       registers it in `stored_files`, creates or updates the `installations` record, and triggers `http://127.0.0.1:28811/enqueue?id=<id>`.
-    - If `device_udid` or `apple_id` are omitted, automatically uses the primary registered device and Apple ID from Sideloadly.
+    - If `device_udid` or `apple_id` are omitted, automatically discovers the primary registered device and Apple ID from Sideloadly.
     """
+    plat_err = _check_platform_error()
+    if plat_err:
+        return plat_err
+
     src_ipa = Path(ipa_path).resolve()
     meta = inspect_ipa_metadata(src_ipa)
     paths = get_paths()
     paths.cache_dir.mkdir(parents=True, exist_ok=True)
 
-    # Calculate MD5 hash of the IPA (Sideloadly uses 16-byte raw MD5 in stored_files.hash and <md5_hex>.ipa as stored_name)
+    # Calculate MD5 hash of the IPA (Sideloadly stores 16-byte raw MD5 in stored_files.hash and <md5_hex>.ipa on disk)
     md5 = hashlib.md5()
     with src_ipa.open("rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
@@ -567,7 +853,9 @@ def install_or_update_ipa(
 
     now_str = now_go_iso()
 
-    with get_db_connection(readonly=False) as conn:
+    def _upsert_db(conn: sqlite3.Connection) -> dict[str, Any]:
+        nonlocal device_udid, apple_id
+
         # 1. Resolve device_udid if not provided
         if not device_udid:
             dev_row = conn.execute(
@@ -583,25 +871,29 @@ def install_or_update_ipa(
                 dev_row2 = conn.execute("SELECT udid FROM devices LIMIT 1").fetchone()
                 if dev_row2:
                     device_udid = dev_row2[0]
+                else:
+                    device_udid = _discover_device_udid_from_log(paths)
         if not device_udid:
             raise ValueError("No iOS device found in Sideloadly database. Connect a device or specify device_udid.")
 
-        # 2. Resolve apple_id and team suffix if not provided
+        # 2. Resolve apple_id and defaults (supports brand-new PCs with 0 prior installations)
         existing_ins = conn.execute(
-            "SELECT apple_id, final_bundle_id, anisette_mode, sign_mode FROM installations WHERE deleted_at IS NULL ORDER BY updated_at DESC LIMIT 1"
+            "SELECT apple_id, final_bundle_id, anisette_mode, sign_mode FROM installations "
+            "WHERE deleted_at IS NULL ORDER BY updated_at DESC LIMIT 1"
         ).fetchone()
 
         if not apple_id:
             if existing_ins and existing_ins["apple_id"]:
                 apple_id = existing_ins["apple_id"]
-            elif paths.account_appids_path.exists():
-                acc_data = json.loads(paths.account_appids_path.read_text(encoding="utf-8"))
-                if acc_data:
-                    apple_id = next(iter(acc_data.keys()))
+            else:
+                discovered = _discover_accounts(paths)
+                if discovered:
+                    apple_id = discovered[0]
         if not apple_id:
             raise ValueError("No Apple ID found in Sideloadly. Specify apple_id or log in via Sideloadly GUI once.")
 
-        anisette_mode = existing_ins["anisette_mode"] if existing_ins else 2
+        default_anisette = existing_ins["anisette_mode"] if existing_ins else 2
+        anisette_mode = _read_anisette_mode(paths, fallback=default_anisette)
         sign_mode = existing_ins["sign_mode"] if existing_ins else 3
 
         # Determine final_bundle_id (preserve team ID suffix if Sideloadly uses one, e.g. .R5J9P5LKTH)
@@ -646,7 +938,7 @@ def install_or_update_ipa(
         token = secrets.token_hex(16)
         ins_row = conn.execute(
             """
-            SELECT id FROM installations
+            SELECT id, last_updated, last_failure_at FROM installations
             WHERE device_udid = ? AND final_bundle_id = ? AND one_off = 0 AND deleted_at IS NULL
             LIMIT 1
             """,
@@ -655,6 +947,12 @@ def install_or_update_ipa(
 
         if ins_row:
             ins_id = ins_row["id"]
+            before_state = {
+                "last_updated": ins_row["last_updated"],
+                "last_error": "",
+                "failures_count": 0,
+                "last_failure_at": ins_row["last_failure_at"] or ZERO_TIME,
+            }
             conn.execute(
                 """
                 UPDATE installations
@@ -678,6 +976,12 @@ def install_or_update_ipa(
             )
             action = "updated_existing_installation"
         else:
+            before_state = {
+                "last_updated": ZERO_TIME,
+                "last_error": "",
+                "failures_count": 0,
+                "last_failure_at": ZERO_TIME,
+            }
             cur = conn.execute(
                 """
                 INSERT INTO installations (
@@ -711,21 +1015,67 @@ def install_or_update_ipa(
             action = "created_new_installation"
 
         conn.commit()
+        return {
+            "action": action,
+            "ins_id": ins_id,
+            "ipa_id": ipa_id,
+            "app_name": app_name,
+            "final_bundle_id": final_bundle_id,
+            "device_udid": device_udid,
+            "apple_id": apple_id,
+            "before_state": before_state,
+        }
 
-    # 5. Notify Sideloadly IPC (with retries) and wait for the install to finish
-    outcome = enqueue_via_ipc(ins_id, wait_for_completion=wait_for_completion)
+    db_res = _run_db_with_retry(_upsert_db, readonly=False)
+
+    # 5. Notify Sideloadly IPC (with retries) and optionally wait for the install to finish
+    outcome = enqueue_via_ipc(
+        db_res["ins_id"],
+        before_state=db_res["before_state"],
+        wait_for_completion=wait_for_completion,
+    )
     return {
-        "action": action,
-        "installation_id": ins_id,
-        "stored_file_id": ipa_id,
+        "action": db_res["action"],
+        "installation_id": db_res["ins_id"],
+        "stored_file_id": db_res["ipa_id"],
         "cached_ipa_path": str(cached_ipa_path),
-        "app_name": app_name,
+        "app_name": db_res["app_name"],
         "version": meta["version"],
-        "final_bundle_id": final_bundle_id,
-        "device_udid": device_udid,
-        "apple_id": apple_id,
+        "final_bundle_id": db_res["final_bundle_id"],
+        "device_udid": db_res["device_udid"],
+        "apple_id": db_res["apple_id"],
         **outcome,
     }
+
+
+@mcp.tool()
+def cancel_queue(installation_id: Optional[int] = None) -> dict[str, Any]:
+    """Clear pending/stuck enqueued tasks in Sideloadly's database.
+    If `installation_id` is provided, clears only that installation; otherwise clears all enqueued tasks.
+    """
+    plat_err = _check_platform_error()
+    if plat_err:
+        return plat_err
+
+    def _clear(conn: sqlite3.Connection) -> int:
+        if installation_id is not None:
+            cur = conn.execute(
+                "UPDATE installations SET enqueued_at = ?, enqueue_token = '' WHERE id = ? AND enqueued_at NOT LIKE '0001-01-01%'",
+                (ZERO_TIME, installation_id),
+            )
+        else:
+            cur = conn.execute(
+                "UPDATE installations SET enqueued_at = ?, enqueue_token = '' WHERE enqueued_at NOT LIKE '0001-01-01%'",
+                (ZERO_TIME,),
+            )
+        conn.commit()
+        return cur.rowcount
+
+    try:
+        cleared = _run_db_with_retry(_clear, readonly=False)
+        return {"cleared_count": cleared, "installation_id": installation_id}
+    except FileNotFoundError as e:
+        return {"cleared_count": 0, "error": str(e)}
 
 
 @mcp.tool()
@@ -738,7 +1088,6 @@ def get_device_installed_apps(search_query: Optional[str] = None) -> dict[str, A
         return {"error": f"Daemon log not found at {paths.daemon_log_path}", "apps": []}
 
     text = paths.daemon_log_path.read_text(encoding="utf-8", errors="replace")
-    # Find the most recent 'Installed apps on <UDID>: <count> [...]' line
     matches = list(re.finditer(r"Installed apps on ([0-9A-Za-z-]+): (\d+) \[(.*)\]", text))
     if not matches:
         return {
@@ -750,7 +1099,6 @@ def get_device_installed_apps(search_query: Optional[str] = None) -> dict[str, A
     device_udid = last_match.group(1)
     raw_list = last_match.group(3)
 
-    # Entries look like: {bundle_id AppName User ExecName Version Build DisplayName /private/var/mobile/...}
     entries = re.findall(r"\{([^{}]+)\}", raw_list)
     apps = []
     for entry in entries:
@@ -799,10 +1147,15 @@ def control_sideloadly(action: str = "status", ipa_path: Optional[str] = None) -
     Supported `action` values:
     - `status`: Check running PIDs and port 28811 IPC status
     - `raise`: Bring the Sideloadly GUI window to the foreground (or open an IPA in the GUI if `ipa_path` is provided)
-    - `start_silent`: Start `sideloadly.exe --silent` in the background
+    - `start_silent`: Start `sideloadly.exe --silent ENQUEUE` in the background
+    - `start_gui`: Start `sideloadly.exe` normally in GUI mode
     - `start_daemon`: Start `sideloadlydaemon.exe`
     - `restart_gui`: Request Sideloadly GUI to restart via `http://127.0.0.1:28811/restart`
     """
+    plat_err = _check_platform_error()
+    if plat_err:
+        return plat_err
+
     paths = get_paths()
     action = action.lower().strip()
 
@@ -813,20 +1166,33 @@ def control_sideloadly(action: str = "status", ipa_path: Optional[str] = None) -
         }
 
     if action == "raise":
-        ensure_sideloadly_running()
+        proc_info = ensure_sideloadly_running(mode="gui")
         params = {}
         if ipa_path:
             params["fn"] = str(Path(ipa_path).resolve())
-        resp = httpx.get(f"{IPC_BASE_URL}/raise", params=params, timeout=5.0)
-        return {"action": "raise", "status_code": resp.status_code, "response": resp.text.strip()}
+        try:
+            resp = httpx.get(f"{IPC_BASE_URL}/raise", params=params, timeout=5.0)
+            return {
+                "action": "raise",
+                "status_code": resp.status_code,
+                "response": resp.text.strip(),
+                "sideloadly_process": proc_info,
+            }
+        except Exception as e:
+            return {"action": "raise", "error": str(e), "sideloadly_process": proc_info}
+
+    if action == "start_gui":
+        return ensure_sideloadly_running(mode="gui")
 
     if action == "start_silent":
-        return ensure_sideloadly_running()
+        return ensure_sideloadly_running(mode="enqueue")
 
     if action == "start_daemon":
         procs = get_running_processes()
         if procs["sideloadlydaemon.exe"]:
             return {"running": True, "already_running": True, "pids": procs["sideloadlydaemon.exe"]}
+        if not paths.daemon_exe_path.exists():
+            return {"running": False, "error": f"sideloadlydaemon.exe not found at {paths.daemon_exe_path}"}
         subprocess.Popen(
             [str(paths.daemon_exe_path)],
             cwd=str(paths.local_dir),
@@ -846,7 +1212,9 @@ def control_sideloadly(action: str = "status", ipa_path: Optional[str] = None) -
         except Exception as e:
             return {"action": "restart_gui", "message": f"Restart triggered ({e})"}
 
-    raise ValueError(f"Unsupported action: {action}. Use status, raise, start_silent, start_daemon, or restart_gui.")
+    raise ValueError(
+        f"Unsupported action: {action}. Use status, raise, start_gui, start_silent, start_daemon, or restart_gui."
+    )
 
 
 def main() -> None:

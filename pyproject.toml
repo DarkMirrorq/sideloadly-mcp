@@ -4,19 +4,29 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sideloadly-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Windows Model Context Protocol (MCP) server for Sideloadly iOS/iPadOS IPA signing, auto-refresh, device and installation management."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
-    {name = "Poyraz"}
+    {name = "Poyraz Yildirim"}
 ]
-keywords = ["mcp", "sideloadly", "ios", "ipa", "sideload", "windows", "apple"]
+keywords = ["mcp", "sideloadly", "ios", "ipa", "sideload", "windows", "apple", "ai-agent", "skill"]
 dependencies = [
     "mcp>=1.0.0",
     "httpx>=0.25.0",
 ]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/DarkMirrorq/sideloadly-mcp"
+Repository = "https://github.com/DarkMirrorq/sideloadly-mcp"
+Issues = "https://github.com/DarkMirrorq/sideloadly-mcp/issues"
 
 [project.scripts]
 sideloadly-mcp = "sideloadly_mcp.server:main"
