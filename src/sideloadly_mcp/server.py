@@ -1,6 +1,6 @@
-"""Sideloadly Windows MCP Server (v0.2.0).
+"""Sideloadly Windows MCP Server (v0.3.0).
 
-Provides full programmatic control over Sideloadly on Windows:
+Provides full programmatic control over Sideloadly on Windows plus a Zero-Mac GitHub Actions iOS Cloud Build pipeline:
 - Auto-discovers Sideloadly installation (env var, standard paths, Windows Registry, running process),
   SQLite database, MD5 IPA cache, and roaming session directories
 - Reads and manages iOS/iPadOS devices, installations, Apple ID App ID quotas, and options
@@ -8,12 +8,17 @@ Provides full programmatic control over Sideloadly on Windows:
   with cold-start retries, SQLite lock handling, and accurate completion/error tracking
 - Parses IPA Info.plist metadata automatically
 - Manages Sideloadly GUI / Daemon processes, stuck queues, and daemon logs
+- Zero-Mac iOS Cloud Build & Sideload Pipeline: detects Flutter, Swift (Xcode/XcodeGen), and React Native projects
+  on Windows, loads GITHUB_PAT from .env, syncs to a private GitHub repository, compiles an unsigned .ipa on
+  GitHub Actions macos-latest, downloads the artifact, and installs it to the connected iPhone via Sideloadly.
 """
 
 from __future__ import annotations
 
+import base64
 import datetime
 import hashlib
+import io
 import json
 import os
 import plistlib
@@ -554,6 +559,13 @@ def sideloadly_doctor() -> dict[str, Any]:
         "configured_apple_ids": accounts,
         "registered_devices_count": device_count,
         "active_installations_count": installation_count,
+        "cloud_build_optional_addon": {
+            "optional": True,
+            "git_installed": shutil.which("git") is not None,
+            "github_pat_configured": _resolve_github_pat_info()[0] is not None,
+            "github_pat_source": _resolve_github_pat_info()[1],
+            "note": "Only needed if compiling source code (Flutter/Swift/React Native) via GitHub Actions. Not required for normal .ipa sideloading or auto-refresh.",
+        },
         "recommendations": issues,
     }
 
@@ -1215,6 +1227,991 @@ def control_sideloadly(action: str = "status", ipa_path: Optional[str] = None) -
     raise ValueError(
         f"Unsupported action: {action}. Use status, raise, start_gui, start_silent, start_daemon, or restart_gui."
     )
+
+
+# ============================================================================
+# Zero-Mac GitHub Actions iOS Cloud Build & Sideload Pipeline (v0.3.0)
+# Supports: Flutter, Swift (Xcode / XcodeGen), React Native (Bare & Expo)
+# Auth: Reads GITHUB_PAT (or GITHUB_TOKEN / GH_TOKEN) from .env
+# ============================================================================
+
+GITHUB_API_BASE = "https://api.github.com"
+WORKFLOW_REL_PATH = Path(".github") / "workflows" / "sideloadly-ios-build.yml"
+PAT_ENV_KEYS = ("GITHUB_PAT", "GITHUB_TOKEN", "GH_TOKEN")
+
+FLUTTER_WORKFLOW_YAML = """name: Sideloadly iOS Cloud Build (Flutter)
+
+on:
+  push:
+    branches: [ main, master, sideloadly-build ]
+  workflow_dispatch:
+
+jobs:
+  build-ios-ipa:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Ensure iOS runner exists and fetch dependencies
+        run: |
+          if [ ! -d "ios" ]; then
+            flutter create --platforms=ios .
+          fi
+          flutter pub get
+
+      - name: Build unsigned iOS release bundle
+        run: |
+          flutter build ios --release --no-codesign
+
+      - name: Package Payload into unsigned .ipa
+        run: |
+          rm -rf Payload unsigned.ipa
+          mkdir -p Payload
+          APP_PATH=$(find build/ios/iphoneos -maxdepth 1 -name "*.app" | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::No .app bundle found in build/ios/iphoneos"
+            exit 1
+          fi
+          cp -R "$APP_PATH" Payload/
+          zip -qry unsigned.ipa Payload
+
+      - name: Upload unsigned IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-ipa
+          path: unsigned.ipa
+          if-no-files-found: error
+"""
+
+SWIFT_WORKFLOW_YAML = """name: Sideloadly iOS Cloud Build (Swift)
+
+on:
+  push:
+    branches: [ main, master, sideloadly-build ]
+  workflow_dispatch:
+
+jobs:
+  build-ios-ipa:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate Xcode project via XcodeGen if project.yml exists
+        run: |
+          if [ -f "project.yml" ]; then
+            if ! command -v xcodegen >/dev/null 2>&1; then
+              brew install xcodegen
+            fi
+            xcodegen generate
+          fi
+
+      - name: Build unsigned iOS app with xcodebuild
+        run: |
+          WORKSPACE=$(find . -maxdepth 2 -name "*.xcworkspace" ! -path "*.xcodeproj/*" | head -n 1)
+          PROJECT=$(find . -maxdepth 2 -name "*.xcodeproj" | head -n 1)
+          if [ -n "$WORKSPACE" ]; then
+            SCHEME=$(xcodebuild -workspace "$WORKSPACE" -list -json | python3 -c "import sys,json; d=json.load(sys.stdin); s=[x for x in d.get('workspace',{}).get('schemes',[]) if not x.startswith('Pods')]; print(s[0] if s else '')")
+            xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" -configuration Release -sdk iphoneos -derivedDataPath build \\
+              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" AD_HOC_CODE_SIGNING_ALLOWED=YES build
+          elif [ -n "$PROJECT" ]; then
+            SCHEME=$(xcodebuild -project "$PROJECT" -list -json | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('project',{}).get('schemes',[''])[0])")
+            xcodebuild -project "$PROJECT" -scheme "$SCHEME" -configuration Release -sdk iphoneos -derivedDataPath build \\
+              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" AD_HOC_CODE_SIGNING_ALLOWED=YES build
+          else
+            echo "::error::No .xcworkspace, .xcodeproj, or project.yml found in repository."
+            exit 1
+          fi
+
+      - name: Package Payload into unsigned .ipa
+        run: |
+          rm -rf Payload unsigned.ipa
+          mkdir -p Payload
+          APP_PATH=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::No .app bundle found in build/Build/Products/Release-iphoneos"
+            exit 1
+          fi
+          cp -R "$APP_PATH" Payload/
+          zip -qry unsigned.ipa Payload
+
+      - name: Upload unsigned IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-ipa
+          path: unsigned.ipa
+          if-no-files-found: error
+"""
+
+REACT_NATIVE_WORKFLOW_YAML = """name: Sideloadly iOS Cloud Build (React Native)
+
+on:
+  push:
+    branches: [ main, master, sideloadly-build ]
+  workflow_dispatch:
+
+jobs:
+  build-ios-ipa:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install JS dependencies and CocoaPods
+        run: |
+          if [ -f "yarn.lock" ]; then
+            yarn install
+          elif [ -f "pnpm-lock.yaml" ]; then
+            npx pnpm install
+          else
+            npm install --legacy-peer-deps
+          fi
+          if [ ! -d "ios" ]; then
+            npx expo prebuild --platform ios --no-install
+          fi
+          cd ios
+          pod install --repo-update
+
+      - name: Build unsigned iOS app with xcodebuild
+        run: |
+          cd ios
+          WORKSPACE=$(find . -maxdepth 1 -name "*.xcworkspace" | head -n 1)
+          PROJECT=$(find . -maxdepth 1 -name "*.xcodeproj" | head -n 1)
+          if [ -n "$WORKSPACE" ]; then
+            SCHEME=$(xcodebuild -workspace "$WORKSPACE" -list -json | python3 -c "import sys,json; d=json.load(sys.stdin); s=[x for x in d.get('workspace',{}).get('schemes',[]) if not x.startswith('Pods')]; print(s[0] if s else '')")
+            xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" -configuration Release -sdk iphoneos -derivedDataPath ../build \\
+              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" AD_HOC_CODE_SIGNING_ALLOWED=YES build
+          elif [ -n "$PROJECT" ]; then
+            SCHEME=$(xcodebuild -project "$PROJECT" -list -json | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('project',{}).get('schemes',[''])[0])")
+            xcodebuild -project "$PROJECT" -scheme "$SCHEME" -configuration Release -sdk iphoneos -derivedDataPath ../build \\
+              CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" AD_HOC_CODE_SIGNING_ALLOWED=YES build
+          else
+            echo "::error::No Xcode workspace or project found inside ios/ directory."
+            exit 1
+          fi
+
+      - name: Package Payload into unsigned .ipa
+        run: |
+          rm -rf Payload unsigned.ipa
+          mkdir -p Payload
+          APP_PATH=$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::No .app bundle found in build/Build/Products/Release-iphoneos"
+            exit 1
+          fi
+          cp -R "$APP_PATH" Payload/
+          zip -qry unsigned.ipa Payload
+
+      - name: Upload unsigned IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-ipa
+          path: unsigned.ipa
+          if-no-files-found: error
+"""
+
+WORKFLOW_TEMPLATES: dict[str, str] = {
+    "flutter": FLUTTER_WORKFLOW_YAML,
+    "swift": SWIFT_WORKFLOW_YAML,
+    "react_native": REACT_NATIVE_WORKFLOW_YAML,
+}
+
+
+def _parse_dotenv_file(env_path: Path) -> dict[str, str]:
+    """Parse a .env file into a dictionary without external dependencies."""
+    values: dict[str, str] = {}
+    if not env_path.exists() or not env_path.is_file():
+        return values
+    try:
+        for raw_line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[7:].strip()
+            if "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = key.strip()
+            val = val.strip()
+            if len(val) >= 2 and ((val[0] == val[-1] == '"') or (val[0] == val[-1] == "'")):
+                val = val[1:-1]
+            elif " #" in val:
+                val = val.split(" #", 1)[0].strip()
+            if key:
+                values[key] = val
+    except Exception:
+        pass
+    return values
+
+
+def _resolve_github_pat_info(
+    project_dir: Optional[Path] = None,
+    env_file: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """Locate the GitHub PAT token from .env files or process environment variables.
+    Returns (token, source_description). Never exposes the token value in source_description.
+    """
+    candidate_files: list[Path] = []
+    if env_file:
+        candidate_files.append(Path(env_file).resolve())
+    if project_dir:
+        candidate_files.append(Path(project_dir).resolve() / ".env")
+    candidate_files.append(Path.cwd() / ".env")
+    try:
+        candidate_files.append(get_paths().local_dir / ".env")
+    except Exception:
+        pass
+    pkg_root_env = Path(__file__).resolve().parents[2] / ".env"
+    candidate_files.append(pkg_root_env)
+
+    seen: set[Path] = set()
+    for fpath in candidate_files:
+        if fpath in seen:
+            continue
+        seen.add(fpath)
+        parsed = _parse_dotenv_file(fpath)
+        for k in PAT_ENV_KEYS:
+            tok = parsed.get(k, "").strip()
+            if tok:
+                return tok, f"{fpath} ({k})"
+
+    for k in PAT_ENV_KEYS:
+        tok = os.environ.get(k, "").strip()
+        if tok:
+            return tok, f"environment ({k})"
+
+    return None, None
+
+
+def _require_github_pat(project_dir: Optional[Path] = None, env_file: Optional[str] = None) -> tuple[str, str]:
+    tok, src = _resolve_github_pat_info(project_dir=project_dir, env_file=env_file)
+    if not tok or not src:
+        raise ValueError(
+            "GitHub Personal Access Token (PAT) not found. "
+            "Define GITHUB_PAT=ghp_... inside a .env file in your project directory (or Sideloadly directory) "
+            "with 'repo' and 'workflow' permissions."
+        )
+    return tok, src
+
+
+def _github_headers(token: str) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "sideloadly-mcp/0.3.0",
+    }
+
+
+def detect_ios_project_type(project_dir: Path) -> str:
+    """Detect whether a directory is a Flutter, React Native, or Swift iOS project."""
+    if not project_dir.exists():
+        raise FileNotFoundError(f"Project directory not found: {project_dir}")
+
+    if (project_dir / "pubspec.yaml").exists():
+        return "flutter"
+
+    pkg_json = project_dir / "package.json"
+    if pkg_json.exists():
+        try:
+            data = json.loads(pkg_json.read_text(encoding="utf-8", errors="replace"))
+            deps = {
+                **(data.get("dependencies") or {}),
+                **(data.get("devDependencies") or {}),
+            }
+            if "react-native" in deps or "expo" in deps:
+                return "react_native"
+        except Exception:
+            pass
+
+    if (
+        (project_dir / "project.yml").exists()
+        or (project_dir / "Package.swift").exists()
+        or list(project_dir.glob("*.xcodeproj"))
+        or list(project_dir.glob("*.xcworkspace"))
+        or list(project_dir.rglob("*.swift"))
+    ):
+        return "swift"
+
+    raise ValueError(
+        f"Could not auto-detect project type in {project_dir}. "
+        "Supported types: 'flutter' (pubspec.yaml), 'react_native' (package.json with react-native/expo), "
+        "or 'swift' (*.xcodeproj, *.xcworkspace, project.yml, or *.swift)."
+    )
+
+
+def _ensure_safe_gitignore(project_dir: Path, project_type: str) -> Path:
+    """Ensure .gitignore exists and excludes .env files and heavy build folders so secrets/junk are never pushed."""
+    gitignore_path = project_dir / ".gitignore"
+    existing_lines: list[str] = []
+    if gitignore_path.exists():
+        existing_lines = gitignore_path.read_text(encoding="utf-8", errors="replace").splitlines()
+
+    existing_set = {line.strip() for line in existing_lines}
+    must_ignore = [".env", ".env.*", "!.env.example", "unsigned.ipa", "Payload/"]
+    if project_type == "flutter":
+        must_ignore.extend(["/build/", ".dart_tool/", ".flutter-plugins", ".flutter-plugins-dependencies"])
+    elif project_type == "react_native":
+        must_ignore.extend(["node_modules/", "ios/Pods/", "build/", ".expo/"])
+    elif project_type == "swift":
+        must_ignore.extend(["build/", "DerivedData/", ".build/", "Pods/"])
+
+    added = [entry for entry in must_ignore if entry not in existing_set]
+    if added:
+        content = "\n".join(existing_lines).rstrip()
+        if content:
+            content += "\n"
+        content += "# Added by sideloadly-mcp (protect .env secrets & build artifacts)\n"
+        content += "\n".join(added) + "\n"
+        gitignore_path.write_text(content, encoding="utf-8")
+    return gitignore_path
+
+
+def _scaffold_swift_xcodegen_if_needed(
+    project_dir: Path,
+    app_name: Optional[str] = None,
+    bundle_id: Optional[str] = None,
+) -> Optional[Path]:
+    """If a Swift project on Windows has no .xcodeproj/.xcworkspace/project.yml, scaffold a clean project.yml for XcodeGen."""
+    if (
+        (project_dir / "project.yml").exists()
+        or list(project_dir.glob("*.xcodeproj"))
+        or list(project_dir.glob("*.xcworkspace"))
+    ):
+        return None
+
+    clean_name = re.sub(r"[^A-Za-z0-9_]", "", app_name or project_dir.name) or "SideloadlySwiftApp"
+    clean_bundle = bundle_id or f"com.sideloadly.{clean_name.lower()}"
+
+    swift_files = list(project_dir.rglob("*.swift"))
+    if not swift_files:
+        src_dir = project_dir / "Sources"
+        src_dir.mkdir(parents=True, exist_ok=True)
+        (src_dir / "App.swift").write_text(
+            "import SwiftUI\n\n"
+            "@main\n"
+            f"struct {clean_name}App: App {{\n"
+            "    var body: some Scene {\n"
+            "        WindowGroup {\n"
+            f'            Text("Hello from {clean_name} (Built via Sideloadly MCP)")\n'
+            "                .padding()\n"
+            "        }\n"
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        sources_path = "Sources"
+    else:
+        first_rel = swift_files[0].relative_to(project_dir)
+        sources_path = first_rel.parts[0] if len(first_rel.parts) > 1 else "."
+
+    project_yml = project_dir / "project.yml"
+    project_yml.write_text(
+        f"name: {clean_name}\n"
+        "options:\n"
+        f"  bundleIdPrefix: {clean_bundle.rsplit('.', 1)[0]}\n"
+        "  deploymentTarget:\n"
+        '    iOS: "16.0"\n'
+        "targets:\n"
+        f"  {clean_name}:\n"
+        "    type: application\n"
+        "    platform: iOS\n"
+        "    sources:\n"
+        f"      - {sources_path}\n"
+        "    settings:\n"
+        "      base:\n"
+        f"        PRODUCT_BUNDLE_IDENTIFIER: {clean_bundle}\n"
+        "        GENERATE_INFOPLIST_FILE: YES\n"
+        f'        INFOPLIST_KEY_CFBundleDisplayName: "{app_name or clean_name}"\n'
+        '        INFOPLIST_KEY_UILaunchScreen_Generation: YES\n'
+        '        MARKETING_VERSION: "1.0.0"\n'
+        '        CURRENT_PROJECT_VERSION: "1"\n',
+        encoding="utf-8",
+    )
+    return project_yml
+
+
+def _run_git(project_dir: Path, args: list[str], pat_token: Optional[str] = None, timeout: int = 120) -> subprocess.CompletedProcess[str]:
+    """Run a git command inside project_dir. If pat_token is given, injects ephemeral HTTP Basic auth without writing token to disk."""
+    cmd = ["git"]
+    if pat_token:
+        b64 = base64.b64encode(f"x-access-token:{pat_token}".encode("utf-8")).decode("ascii")
+        cmd.extend(["-c", f"http.extraHeader=Authorization: Basic {b64}"])
+    cmd.extend(args)
+
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return subprocess.run(
+        cmd,
+        cwd=str(project_dir),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=env,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+    )
+
+
+def _redact_token(text: str, token: Optional[str]) -> str:
+    if not text or not token:
+        return text
+    b64 = base64.b64encode(f"x-access-token:{token}".encode("utf-8")).decode("ascii")
+    return text.replace(token, "***REDACTED_PAT***").replace(b64, "***REDACTED_AUTH***")
+
+
+@mcp.tool()
+def prepare_ios_cloud_build(
+    project_dir: str,
+    project_type: str = "auto",
+    app_name: Optional[str] = None,
+    bundle_id: Optional[str] = None,
+    overwrite_workflow: bool = False,
+    create_env_example: bool = False,
+) -> dict[str, Any]:
+    """[Optional Cloud Build Add-on] Prepare a Windows project (Flutter, Swift, or React Native) for Zero-Mac GitHub Actions iOS cloud compilation.
+
+    - Auto-detects `flutter`, `swift`, or `react_native` (or uses explicit `project_type`).
+    - Generates `.github/workflows/sideloadly-ios-build.yml` configured to build an unsigned `.ipa` on `macos-latest`.
+    - For Swift projects created on Windows without an `.xcodeproj`, automatically scaffolds a `project.yml` for XcodeGen.
+    - Updates `.gitignore` so `.env` secrets and heavy build directories are never pushed to GitHub.
+    """
+    pdir = Path(project_dir).resolve()
+    if not pdir.exists():
+        raise FileNotFoundError(f"Project directory does not exist: {pdir}")
+
+    ptype = project_type.lower().strip()
+    if ptype in ("react-native", "reactnative", "rn", "expo"):
+        ptype = "react_native"
+    elif ptype == "auto":
+        ptype = detect_ios_project_type(pdir)
+
+    if ptype not in WORKFLOW_TEMPLATES:
+        raise ValueError(f"Unsupported project_type '{project_type}'. Choose from: auto, flutter, swift, react_native.")
+
+    workflow_path = pdir / WORKFLOW_REL_PATH
+    workflow_path.parent.mkdir(parents=True, exist_ok=True)
+    workflow_written = False
+    if not workflow_path.exists() or overwrite_workflow:
+        workflow_path.write_text(WORKFLOW_TEMPLATES[ptype], encoding="utf-8")
+        workflow_written = True
+
+    scaffolded_project_yml: Optional[Path] = None
+    if ptype == "swift":
+        scaffolded_project_yml = _scaffold_swift_xcodegen_if_needed(pdir, app_name=app_name, bundle_id=bundle_id)
+
+    gitignore_path = _ensure_safe_gitignore(pdir, ptype)
+
+    env_example = pdir / ".env.example"
+    if create_env_example and not (pdir / ".env").exists() and not env_example.exists():
+        env_example.write_text(
+            "# GitHub Personal Access Token (PAT) with 'repo' and 'workflow' scopes\n"
+            "GITHUB_PAT=ghp_your_personal_access_token_here\n",
+            encoding="utf-8",
+        )
+
+    pat_tok, pat_src = _resolve_github_pat_info(project_dir=pdir)
+    return {
+        "project_dir": str(pdir),
+        "detected_project_type": ptype,
+        "workflow_path": str(workflow_path),
+        "workflow_written": workflow_written,
+        "scaffolded_xcodegen_project_yml": str(scaffolded_project_yml) if scaffolded_project_yml else None,
+        "gitignore_path": str(gitignore_path),
+        "github_pat_configured": pat_tok is not None,
+        "github_pat_source": pat_src,
+    }
+
+
+@mcp.tool()
+def trigger_ios_cloud_build(
+    project_dir: str,
+    repo_name: Optional[str] = None,
+    private: bool = True,
+    branch: str = "main",
+    project_type: str = "auto",
+    commit_message: str = "chore: trigger iOS cloud build via sideloadly-mcp",
+    env_file: Optional[str] = None,
+) -> dict[str, Any]:
+    """Push a local Flutter, Swift, or React Native project to a private GitHub repository using GITHUB_PAT from .env
+    and trigger the macOS iOS `.ipa` GitHub Actions build.
+
+    - Reads `GITHUB_PAT` (or `GITHUB_TOKEN` / `GH_TOKEN`) from `.env` (never hardcodes or stores tokens in `.git/config`).
+    - Automatically creates the private GitHub repository if it does not exist yet.
+    - Commits and pushes the project and workflow file, then locates or dispatches the GitHub Actions run.
+    """
+    pdir = Path(project_dir).resolve()
+    token, pat_source = _require_github_pat(project_dir=pdir, env_file=env_file)
+    prep = prepare_ios_cloud_build(str(pdir), project_type=project_type)
+
+    headers = _github_headers(token)
+
+    # 1. Verify PAT and resolve GitHub owner/username
+    user_resp = httpx.get(f"{GITHUB_API_BASE}/user", headers=headers, timeout=15.0)
+    if user_resp.status_code != 200:
+        raise RuntimeError(
+            f"GitHub authentication failed (HTTP {user_resp.status_code}): {user_resp.text}. "
+            "Check your GITHUB_PAT in .env and ensure it has 'repo' and 'workflow' permissions."
+        )
+    owner = user_resp.json()["login"]
+
+    # 2. Resolve target repo_name (supports 'owner/repo' or 'repo')
+    if repo_name and "/" in repo_name:
+        owner, clean_repo = repo_name.split("/", 1)
+    else:
+        clean_repo = re.sub(r"[^A-Za-z0-9._-]", "-", (repo_name or f"{pdir.name}-ios-build").strip()).strip("-")
+        if not clean_repo:
+            clean_repo = "sideloadly-ios-cloud-build"
+    repo_full_name = f"{owner}/{clean_repo}"
+
+    # 3. Check if repo exists; if not, create it (private by default)
+    repo_check = httpx.get(f"{GITHUB_API_BASE}/repos/{repo_full_name}", headers=headers, timeout=15.0)
+    repo_created = False
+    if repo_check.status_code == 404:
+        create_resp = httpx.post(
+            f"{GITHUB_API_BASE}/user/repos",
+            headers=headers,
+            json={
+                "name": clean_repo,
+                "private": private,
+                "description": f"Automated iOS cloud build repository managed by sideloadly-mcp ({prep['detected_project_type']})",
+                "auto_init": False,
+            },
+            timeout=20.0,
+        )
+        if create_resp.status_code not in (200, 201):
+            raise RuntimeError(
+                f"Failed to create GitHub repository '{repo_full_name}' (HTTP {create_resp.status_code}): {create_resp.text}"
+            )
+        repo_created = True
+    elif repo_check.status_code != 200:
+        raise RuntimeError(
+            f"Failed checking GitHub repository '{repo_full_name}' (HTTP {repo_check.status_code}): {repo_check.text}"
+        )
+
+    # 4. Initialize local Git repo, ensure .env is untracked, commit, and push with ephemeral HTTP header
+    if not (pdir / ".git").exists():
+        init_res = _run_git(pdir, ["init", "-b", branch])
+        if init_res.returncode != 0:
+            _run_git(pdir, ["init"])
+            _run_git(pdir, ["checkout", "-B", branch])
+
+    # Ensure git user.name and user.email are configured locally so commit never fails on fresh PCs
+    if not _run_git(pdir, ["config", "user.name"]).stdout.strip():
+        _run_git(pdir, ["config", "user.name", owner])
+    if not _run_git(pdir, ["config", "user.email"]).stdout.strip():
+        _run_git(pdir, ["config", "user.email", f"{owner}@users.noreply.github.com"])
+
+    # Make sure .env is never staged even if someone previously added it
+    _run_git(pdir, ["rm", "--cached", "--ignore-unmatch", ".env"])
+    _run_git(pdir, ["add", "-A"])
+
+    status_res = _run_git(pdir, ["status", "--porcelain"])
+    if status_res.stdout.strip():
+        commit_res = _run_git(pdir, ["commit", "-m", commit_message])
+        if commit_res.returncode != 0:
+            raise RuntimeError(f"Git commit failed: {_redact_token(commit_res.stderr or commit_res.stdout, token)}")
+
+    # Ensure branch exists / matches
+    _run_git(pdir, ["branch", "-M", branch])
+    head_sha = _run_git(pdir, ["rev-parse", "HEAD"]).stdout.strip()
+
+    clean_remote_url = f"https://github.com/{repo_full_name}.git"
+    remotes = _run_git(pdir, ["remote"]).stdout.splitlines()
+    if "sideloadly-cloud" in [r.strip() for r in remotes]:
+        _run_git(pdir, ["remote", "set-url", "sideloadly-cloud", clean_remote_url])
+    else:
+        _run_git(pdir, ["remote", "add", "sideloadly-cloud", clean_remote_url])
+
+    push_res = _run_git(pdir, ["push", "-u", "--force", "sideloadly-cloud", f"HEAD:refs/heads/{branch}"], pat_token=token)
+    if push_res.returncode != 0:
+        err_msg = _redact_token(push_res.stderr or push_res.stdout, token)
+        raise RuntimeError(
+            f"Git push to {clean_remote_url} failed: {err_msg}. "
+            "Ensure your GITHUB_PAT has 'repo' and 'workflow' scopes enabled."
+        )
+
+    # 5. Locate the triggered workflow run for head_sha (or dispatch workflow_dispatch if none started automatically)
+    run_id: Optional[int] = None
+    run_url: Optional[str] = None
+    run_status: Optional[str] = None
+
+    for attempt in range(1, 6):
+        time.sleep(2.0)
+        runs_resp = httpx.get(
+            f"{GITHUB_API_BASE}/repos/{repo_full_name}/actions/runs",
+            headers=headers,
+            params={"head_sha": head_sha, "per_page": 5},
+            timeout=15.0,
+        )
+        if runs_resp.status_code == 200:
+            runs = runs_resp.json().get("workflow_runs") or []
+            if runs:
+                run_id = runs[0]["id"]
+                run_url = runs[0].get("html_url")
+                run_status = runs[0].get("status")
+                break
+        if attempt == 2:
+            # Explicitly trigger workflow_dispatch in case push didn't fire (e.g. identical commit SHA)
+            httpx.post(
+                f"{GITHUB_API_BASE}/repos/{repo_full_name}/actions/workflows/sideloadly-ios-build.yml/dispatches",
+                headers=headers,
+                json={"ref": branch},
+                timeout=15.0,
+            )
+
+    return {
+        "repo_full_name": repo_full_name,
+        "repo_url": f"https://github.com/{repo_full_name}",
+        "repo_created": repo_created,
+        "private": private,
+        "branch": branch,
+        "head_sha": head_sha,
+        "project_type": prep["detected_project_type"],
+        "github_pat_source": pat_source,
+        "run_id": run_id,
+        "run_url": run_url,
+        "run_status": run_status or "queued",
+    }
+
+
+def _extract_failure_log_tail(raw_log: str, max_lines: int = 80) -> list[str]:
+    """Extract the most relevant compiler/Xcode/Flutter error lines from a GitHub Actions job log."""
+    lines = raw_log.splitlines()
+    error_indices = [
+        i
+        for i, line in enumerate(lines)
+        if any(
+            kw in line.lower()
+            for kw in ("error:", "##[error]", "fatal error:", "build failed", "exception:", "pod install")
+        )
+    ]
+    if error_indices:
+        first_err = max(0, error_indices[0] - 5)
+        last_err = min(len(lines), error_indices[-1] + 25)
+        snippet = lines[first_err:last_err]
+        return snippet[-max_lines:]
+    return lines[-max_lines:]
+
+
+@mcp.tool()
+def get_ios_cloud_build_status(
+    repo_full_name: str,
+    run_id: Optional[int] = None,
+    include_error_logs: bool = True,
+    project_dir: Optional[str] = None,
+    env_file: Optional[str] = None,
+) -> dict[str, Any]:
+    """Check the live status of a GitHub Actions iOS cloud build, list produced `.ipa` artifacts,
+    and automatically extract Xcode/Flutter compiler error logs if the build failed.
+    """
+    pdir = Path(project_dir).resolve() if project_dir else None
+    token, pat_source = _require_github_pat(project_dir=pdir, env_file=env_file)
+    headers = _github_headers(token)
+
+    if run_id is None:
+        runs_resp = httpx.get(
+            f"{GITHUB_API_BASE}/repos/{repo_full_name}/actions/runs",
+            headers=headers,
+            params={"per_page": 1},
+            timeout=15.0,
+        )
+        if runs_resp.status_code != 200:
+            raise RuntimeError(f"Failed fetching workflow runs (HTTP {runs_resp.status_code}): {runs_resp.text}")
+        runs = runs_resp.json().get("workflow_runs") or []
+        if not runs:
+            return {"found": False, "repo_full_name": repo_full_name, "error": "No workflow runs found."}
+        run_data = runs[0]
+        run_id = run_data["id"]
+    else:
+        run_resp = httpx.get(
+            f"{GITHUB_API_BASE}/repos/{repo_full_name}/actions/runs/{run_id}",
+            headers=headers,
+            timeout=15.0,
+        )
+        if run_resp.status_code != 200:
+            raise RuntimeError(f"Failed fetching workflow run {run_id} (HTTP {run_resp.status_code}): {run_resp.text}")
+        run_data = run_resp.json()
+
+    status = run_data.get("status")
+    conclusion = run_data.get("conclusion")
+
+    jobs_Summary: list[dict[str, Any]] = []
+    error_logs: list[str] = []
+    jobs_resp = httpx.get(
+        f"{GITHUB_API_BASE}/repos/{repo_full_name}/actions/runs/{run_id}/jobs",
+        headers=headers,
+        timeout=15.0,
+    )
+    if jobs_resp.status_code == 200:
+        for job in jobs_resp.json().get("jobs") or []:
+            steps = [
+                {
+                    "name": s.get("name"),
+                    "status": s.get("status"),
+                    "conclusion": s.get("conclusion"),
+                }
+                for s in (job.get("steps") or [])
+            ]
+            jobs_Summary.append(
+                {
+                    "job_id": job.get("id"),
+                    "name": job.get("name"),
+                    "status": job.get("status"),
+                    "conclusion": job.get("conclusion"),
+                    "steps": steps,
+                }
+            )
+            if include_error_logs and job.get("conclusion") == "failure":
+                log_resp = httpx.get(
+                    f"{GITHUB_API_BASE}/repos/{repo_full_name}/actions/jobs/{job['id']}/logs",
+                    headers=headers,
+                    follow_redirects=True,
+                    timeout=30.0,
+                )
+                if log_resp.status_code == 200:
+                    error_logs.extend(_extract_failure_log_tail(log_resp.text))
+
+    artifacts: list[dict[str, Any]] = []
+    if status == "completed":
+        art_resp = httpx.get(
+            f"{GITHUB_API_BASE}/repos/{repo_full_name}/actions/runs/{run_id}/artifacts",
+            headers=headers,
+            timeout=15.0,
+        )
+        if art_resp.status_code == 200:
+            for a in art_resp.json().get("artifacts") or []:
+                artifacts.append(
+                    {
+                        "id": a.get("id"),
+                        "name": a.get("name"),
+                        "size_in_bytes": a.get("size_in_bytes"),
+                        "expired": a.get("expired"),
+                        "archive_download_url": a.get("archive_download_url"),
+                    }
+                )
+
+    return {
+        "found": True,
+        "repo_full_name": repo_full_name,
+        "run_id": run_id,
+        "run_url": run_data.get("html_url"),
+        "status": status,
+        "conclusion": conclusion,
+        "head_sha": run_data.get("head_sha"),
+        "created_at": run_data.get("created_at"),
+        "updated_at": run_data.get("updated_at"),
+        "jobs": jobs_Summary,
+        "artifacts": artifacts,
+        "error_logs": error_logs,
+        "github_pat_source": pat_source,
+    }
+
+
+@mcp.tool()
+def download_cloud_build_ipa(
+    repo_full_name: str,
+    run_id: Optional[int] = None,
+    artifact_name: str = "unsigned-ipa",
+    output_dir: Optional[str] = None,
+    install_via_sideloadly: bool = True,
+    device_udid: Optional[str] = None,
+    apple_id: Optional[str] = None,
+    custom_bundle_id: Optional[str] = None,
+    custom_app_name: Optional[str] = None,
+    wait_for_install: bool = True,
+    project_dir: Optional[str] = None,
+    env_file: Optional[str] = None,
+) -> dict[str, Any]:
+    """Download the compiled `.ipa` artifact from a completed GitHub Actions iOS cloud build,
+    extract it to disk, and optionally sign & install it onto the connected iOS device via Sideloadly.
+    """
+    pdir = Path(project_dir).resolve() if project_dir else None
+    token, _ = _require_github_pat(project_dir=pdir, env_file=env_file)
+    headers = _github_headers(token)
+
+    status_info = get_ios_cloud_build_status(
+        repo_full_name=repo_full_name,
+        run_id=run_id,
+        include_error_logs=True,
+        project_dir=project_dir,
+        env_file=env_file,
+    )
+    if not status_info.get("found"):
+        return status_info
+
+    resolved_run_id = status_info["run_id"]
+    if status_info.get("status") != "completed" or status_info.get("conclusion") != "success":
+        return {
+            "downloaded": False,
+            "error": f"Workflow run {resolved_run_id} is not a completed successful build "
+            f"(status={status_info.get('status')}, conclusion={status_info.get('conclusion')}).",
+            "build_status": status_info,
+        }
+
+    artifacts = status_info.get("artifacts") or []
+    target_art = next((a for a in artifacts if a.get("name") == artifact_name), None) or (
+        artifacts[0] if artifacts else None
+    )
+    if not target_art:
+        raise LookupError(f"No artifact named '{artifact_name}' found on run {resolved_run_id}.")
+
+    dl_url = target_art.get("archive_download_url") or (
+        f"{GITHUB_API_BASE}/repos/{repo_full_name}/actions/artifacts/{target_art['id']}/zip"
+    )
+    dl_resp = httpx.get(dl_url, headers=headers, follow_redirects=True, timeout=120.0)
+    if dl_resp.status_code != 200:
+        raise RuntimeError(
+            f"Failed to download artifact zip (HTTP {dl_resp.status_code}): {dl_resp.text}"
+        )
+
+    dest_dir = Path(output_dir).resolve() if output_dir else (get_paths().local_dir / "cloud-builds")
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    safe_repo_slug = repo_full_name.replace("/", "_")
+
+    extracted_ipa_path: Optional[Path] = None
+    with zipfile.ZipFile(io.BytesIO(dl_resp.content), "r") as zf:
+        ipa_entries = [n for n in zf.namelist() if n.lower().endswith(".ipa")]
+        if not ipa_entries:
+            raise ValueError(f"Artifact zip from run {resolved_run_id} did not contain any .ipa file.")
+        ipa_entry = ipa_entries[0]
+        out_path = dest_dir / f"{safe_repo_slug}_{resolved_run_id}.ipa"
+        with zf.open(ipa_entry) as src_f, out_path.open("wb") as dst_f:
+            shutil.copyfileobj(src_f, dst_f)
+        extracted_ipa_path = out_path
+
+    ipa_meta = inspect_ipa_metadata(extracted_ipa_path)
+    result: dict[str, Any] = {
+        "downloaded": True,
+        "repo_full_name": repo_full_name,
+        "run_id": resolved_run_id,
+        "artifact_id": target_art["id"],
+        "ipa_path": str(extracted_ipa_path),
+        "ipa_metadata": ipa_meta,
+    }
+
+    if install_via_sideloadly:
+        install_res = install_or_update_ipa(
+            ipa_path=str(extracted_ipa_path),
+            device_udid=device_udid,
+            apple_id=apple_id,
+            custom_bundle_id=custom_bundle_id,
+            custom_app_name=custom_app_name,
+            wait_for_completion=wait_for_install,
+        )
+        result["sideload_result"] = install_res
+
+    return result
+
+
+@mcp.tool()
+def cloud_build_and_sideload(
+    project_dir: str,
+    repo_name: Optional[str] = None,
+    private: bool = True,
+    branch: str = "main",
+    project_type: str = "auto",
+    device_udid: Optional[str] = None,
+    apple_id: Optional[str] = None,
+    custom_bundle_id: Optional[str] = None,
+    custom_app_name: Optional[str] = None,
+    wait_for_build: bool = True,
+    build_timeout_seconds: int = 1200,
+    poll_interval_seconds: int = 15,
+    install_after_build: bool = True,
+    wait_for_install: bool = True,
+    env_file: Optional[str] = None,
+) -> dict[str, Any]:
+    """End-to-end Zero-Mac Windows-to-iPhone Pipeline:
+    1. Detects project type (`flutter`, `swift`, or `react_native`) and injects the GitHub Actions macOS `.ipa` workflow.
+    2. Authenticates via `GITHUB_PAT` from `.env`, creates/updates a private GitHub repository, and pushes the source.
+    3. Monitors the `macos-latest` GitHub Actions build until completion (returns compiler error logs if build fails).
+    4. Downloads the compiled unsigned `.ipa` artifact to Windows.
+    5. Signs and installs the `.ipa` onto the connected iOS device via Sideloadly!
+    """
+    trigger_res = trigger_ios_cloud_build(
+        project_dir=project_dir,
+        repo_name=repo_name,
+        private=private,
+        branch=branch,
+        project_type=project_type,
+        env_file=env_file,
+    )
+    if not wait_for_build:
+        return {
+            "stage": "triggered",
+            "completed": False,
+            "trigger": trigger_res,
+        }
+
+    repo_full_name = trigger_res["repo_full_name"]
+    run_id = trigger_res.get("run_id")
+    deadline = time.time() + build_timeout_seconds
+    last_status: dict[str, Any] = {}
+
+    while time.time() < deadline:
+        last_status = get_ios_cloud_build_status(
+            repo_full_name=repo_full_name,
+            run_id=run_id,
+            include_error_logs=True,
+            project_dir=project_dir,
+            env_file=env_file,
+        )
+        if last_status.get("found"):
+            run_id = last_status.get("run_id")
+            if last_status.get("status") == "completed":
+                break
+        time.sleep(max(1, poll_interval_seconds))
+
+    if last_status.get("status") != "completed":
+        return {
+            "stage": "build_timeout",
+            "completed": False,
+            "trigger": trigger_res,
+            "build_status": last_status,
+        }
+
+    if last_status.get("conclusion") != "success":
+        return {
+            "stage": "build_failed",
+            "completed": True,
+            "status": "build_failed",
+            "trigger": trigger_res,
+            "build_status": last_status,
+        }
+
+    dl_res = download_cloud_build_ipa(
+        repo_full_name=repo_full_name,
+        run_id=run_id,
+        install_via_sideloadly=install_after_build,
+        device_udid=device_udid,
+        apple_id=apple_id,
+        custom_bundle_id=custom_bundle_id,
+        custom_app_name=custom_app_name,
+        wait_for_install=wait_for_install,
+        project_dir=project_dir,
+        env_file=env_file,
+    )
+    return {
+        "stage": "completed",
+        "completed": True,
+        "status": dl_res.get("sideload_result", {}).get("status", "downloaded"),
+        "trigger": trigger_res,
+        "build_status": last_status,
+        "download_and_sideload": dl_res,
+    }
 
 
 def main() -> None:

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sideloadly-mcp"
-version = "0.2.0"
-description = "Windows Model Context Protocol (MCP) server for Sideloadly iOS/iPadOS IPA signing, auto-refresh, device and installation management."
+version = "0.3.0"
+description = "Windows Model Context Protocol (MCP) server for Sideloadly iOS/iPadOS IPA signing, auto-refresh, and Zero-Mac GitHub Actions iOS cloud build (Flutter, Swift, React Native) + sideload pipeline."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}

@@ -11,6 +11,7 @@ import json
 import os
 import plistlib
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 import zipfile
@@ -274,6 +275,168 @@ class TestSideloadlyMCP(unittest.TestCase):
         self.assertEqual(res["device_udid"], "00008110-TESTDEVICE")
         self.assertEqual(res["total_matched"], 1)
         self.assertEqual(res["apps"][0]["bundle_id"], "com.example.two")
+
+    def test_prepare_ios_cloud_build_flutter_swift_react_native_and_dotenv(self) -> None:
+        # 1. Flutter project detection & workflow generation
+        flutter_dir = self.root / "my_flutter_app"
+        flutter_dir.mkdir()
+        (flutter_dir / "pubspec.yaml").write_text("name: my_flutter_app\n", encoding="utf-8")
+        (flutter_dir / ".env").write_text('GITHUB_PAT="ghp_testSecretToken123"\n', encoding="utf-8")
+
+        prep_fl = server.prepare_ios_cloud_build(str(flutter_dir))
+        self.assertEqual(prep_fl["detected_project_type"], "flutter")
+        self.assertTrue(prep_fl["workflow_written"])
+        self.assertTrue(prep_fl["github_pat_configured"])
+        self.assertIn("GITHUB_PAT", prep_fl["github_pat_source"])
+        wf_text = Path(prep_fl["workflow_path"]).read_text(encoding="utf-8")
+        self.assertIn("flutter build ios --release --no-codesign", wf_text)
+        gi_text = Path(prep_fl["gitignore_path"]).read_text(encoding="utf-8")
+        self.assertIn(".env", gi_text)
+
+        # 2. Swift project on Windows without .xcodeproj -> auto-scaffolds XcodeGen project.yml
+        swift_dir = self.root / "my_swift_app"
+        swift_dir.mkdir()
+        (swift_dir / "ContentView.swift").write_text("import SwiftUI\n", encoding="utf-8")
+        prep_sw = server.prepare_ios_cloud_build(str(swift_dir), app_name="PoiziSwift", bundle_id="com.poizi.swift")
+        self.assertEqual(prep_sw["detected_project_type"], "swift")
+        self.assertIsNotNone(prep_sw["scaffolded_xcodegen_project_yml"])
+        proj_yml = (swift_dir / "project.yml").read_text(encoding="utf-8")
+        self.assertIn("com.poizi.swift", proj_yml)
+
+        # 3. React Native project detection
+        rn_dir = self.root / "my_rn_app"
+        rn_dir.mkdir()
+        (rn_dir / "package.json").write_text(
+            json.dumps({"name": "my-rn-app", "dependencies": {"react": "18.2.0", "react-native": "0.74.0"}}),
+            encoding="utf-8",
+        )
+        prep_rn = server.prepare_ios_cloud_build(str(rn_dir))
+        self.assertEqual(prep_rn["detected_project_type"], "react_native")
+        rn_wf = Path(prep_rn["workflow_path"]).read_text(encoding="utf-8")
+        self.assertIn("pod install", rn_wf)
+
+    def test_cloud_build_and_sideload_end_to_end_with_dotenv_pat(self) -> None:
+        self._init_db(with_device=True)
+        (self.roaming_sl / "cert-dev@example.com.pem").write_text("CERT", encoding="utf-8")
+
+        proj_dir = self.root / "cloud_flutter_app"
+        proj_dir.mkdir()
+        (proj_dir / "pubspec.yaml").write_text("name: cloud_flutter_app\n", encoding="utf-8")
+        (proj_dir / ".env").write_text("GITHUB_PAT=ghp_mockPatFromDotEnv999\n", encoding="utf-8")
+
+        # Build an in-memory artifact zip containing a valid unsigned .ipa
+        ipa_file = make_dummy_ipa(self.root / "unsigned.ipa", bundle_id="com.cloud.flutter", name="CloudFlutter")
+        art_zip_buf = server.io.BytesIO()
+        with zipfile.ZipFile(art_zip_buf, "w") as zf:
+            zf.write(ipa_file, arcname="unsigned.ipa")
+        art_zip_bytes = art_zip_buf.getvalue()
+
+        class FakeBinaryResponse:
+            def __init__(self, status_code: int, data: Any = None, content: bytes = b"", text: str = "") -> None:
+                self.status_code = status_code
+                self._data = data
+                self.content = content
+                self.text = text
+
+            def json(self) -> Any:
+                return self._data
+
+        def fake_httpx_get(url: str, headers=None, params=None, follow_redirects=False, timeout=None):
+            if url.endswith("/user"):
+                self.assertEqual(headers["Authorization"], "Bearer ghp_mockPatFromDotEnv999")
+                return FakeBinaryResponse(200, {"login": "DarkMirrorq"})
+            if url.endswith("/repos/DarkMirrorq/cloud_flutter_app-ios-build"):
+                return FakeBinaryResponse(404, {"message": "Not Found"}, text="Not Found")
+            if url.endswith("/actions/runs") and params:
+                return FakeBinaryResponse(
+                    200,
+                    {
+                        "workflow_runs": [
+                            {
+                                "id": 777,
+                                "html_url": "https://github.com/DarkMirrorq/cloud_flutter_app-ios-build/actions/runs/777",
+                                "status": "completed",
+                                "conclusion": "success",
+                                "head_sha": "abc123sha",
+                            }
+                        ]
+                    },
+                )
+            if url.endswith("/actions/runs/777"):
+                return FakeBinaryResponse(
+                    200,
+                    {
+                        "id": 777,
+                        "html_url": "https://github.com/DarkMirrorq/cloud_flutter_app-ios-build/actions/runs/777",
+                        "status": "completed",
+                        "conclusion": "success",
+                        "head_sha": "abc123sha",
+                    },
+                )
+            if url.endswith("/actions/runs/777/jobs"):
+                return FakeBinaryResponse(
+                    200,
+                    {"jobs": [{"id": 888, "name": "build-ios-ipa", "status": "completed", "conclusion": "success", "steps": []}]},
+                )
+            if url.endswith("/actions/runs/777/artifacts"):
+                return FakeBinaryResponse(
+                    200,
+                    {
+                        "artifacts": [
+                            {
+                                "id": 999,
+                                "name": "unsigned-ipa",
+                                "size_in_bytes": len(art_zip_bytes),
+                                "expired": False,
+                                "archive_download_url": "https://api.github.com/repos/DarkMirrorq/cloud_flutter_app-ios-build/actions/artifacts/999/zip",
+                            }
+                        ]
+                    },
+                )
+            if url.endswith("/artifacts/999/zip"):
+                return FakeBinaryResponse(200, content=art_zip_bytes)
+            if "/enqueue" in url:
+                conn = server.get_db_connection(readonly=False)
+                try:
+                    conn.execute(
+                        "UPDATE installations SET last_updated = ?, enqueued_at = ?, enqueue_token = '' WHERE id = ?",
+                        (server.now_go_iso(), server.ZERO_TIME, int(params["id"])),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+                return FakeResponse(200, "Task enqueuedOK")
+            raise AssertionError(f"Unexpected GET URL: {url}")
+
+        def fake_httpx_post(url: str, headers=None, json=None, timeout=None):
+            if url.endswith("/user/repos"):
+                self.assertTrue(json["private"])
+                return FakeBinaryResponse(201, {"full_name": "DarkMirrorq/cloud_flutter_app-ios-build"})
+            raise AssertionError(f"Unexpected POST URL: {url}")
+
+        def fake_run_git(pdir: Path, args: list[str], pat_token: str = None, timeout: int = 120):
+            if args == ["rev-parse", "HEAD"]:
+                return subprocess.CompletedProcess(args, 0, stdout="abc123sha\n", stderr="")
+            if args == ["status", "--porcelain"]:
+                return subprocess.CompletedProcess(args, 0, stdout="M pubspec.yaml\n", stderr="")
+            if args[0] == "push":
+                self.assertEqual(pat_token, "ghp_mockPatFromDotEnv999")
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        with mock.patch.object(server, "ensure_sideloadly_running", return_value={"running": True, "started_now": False}), \
+             mock.patch.object(server.httpx, "get", side_effect=fake_httpx_get), \
+             mock.patch.object(server.httpx, "post", side_effect=fake_httpx_post), \
+             mock.patch.object(server, "_run_git", side_effect=fake_run_git), \
+             mock.patch.object(server.time, "sleep", return_value=None):
+            res = server.cloud_build_and_sideload(str(proj_dir), poll_interval_seconds=1)
+
+        self.assertEqual(res["stage"], "completed")
+        self.assertTrue(res["completed"])
+        self.assertEqual(res["status"], "installed")
+        self.assertTrue(res["trigger"]["repo_created"])
+        self.assertEqual(res["trigger"]["repo_full_name"], "DarkMirrorq/cloud_flutter_app-ios-build")
+        self.assertEqual(res["download_and_sideload"]["ipa_metadata"]["bundle_id"], "com.cloud.flutter")
+        self.assertEqual(res["download_and_sideload"]["sideload_result"]["status"], "installed")
 
 
 if __name__ == "__main__":
