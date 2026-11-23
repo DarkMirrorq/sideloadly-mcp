@@ -20,7 +20,15 @@ Before running installation tools on a new machine, verify the environment:
 2. The user has signed into their Apple ID inside Sideloadly **once** (creating `sessions.json` / `cert-*.pem` and downloading local Anisette DLLs).
 3. The target iPhone/iPad is paired via USB ("Trust This Computer").
 4. `sideloadly-mcp` is configured in the agent's MCP config (`uvx --from git+https://github.com/DarkMirrorq/sideloadly-mcp sideloadly-mcp`).
-5. *(Optional — Only for Zero-Mac Cloud Builds)* Create a GitHub Personal Access Token (Classic) at `https://github.com/settings/tokens/new` with **`repo`** and **`workflow`** scopes checked (or a Fine-grained token with Read/Write on **Actions**, **Administration**, **Contents**, and **Workflows**), and place `GITHUB_PAT=ghp_...` inside a `.env` file in the project folder or `%LOCALAPPDATA%\Sideloadly\.env`. Normal `.ipa` sideloading and 7-day auto-refresh do NOT require a GitHub token.
+5. *(Optional — Only for Zero-Mac GitHub Actions iOS Cloud Builds)* Normal `.ipa` sideloading and 7-day auto-refresh do **NOT** require a GitHub account or token. If the user wants to compile **Flutter**, **Swift (Xcode / XcodeGen)**, or **React Native / Expo** source code from Windows without a Mac:
+   - **Step A — Generate a GitHub Personal Access Token (PAT):**
+     1. Open **GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)**: `https://github.com/settings/tokens/new`
+     2. Click **Generate new token (classic)** and check two scopes:
+        - ✅ **`repo`** *(Full control of private repositories — needed to auto-create and push to the user's private build repository)*
+        - ✅ **`workflow`** *(Update GitHub Action workflows — needed to push `.github/workflows/sideloadly-ios-build.yml` and download `.ipa` artifacts)*
+        *(Or use a Fine-grained token with Read & Write permissions on **Actions**, **Administration**, **Contents**, and **Workflows**).*
+   - **Step B — Save Token in `.env`:**
+     Place `GITHUB_PAT=ghp_...` inside a `.env` file in the project root (or globally at `%LOCALAPPDATA%\Sideloadly\.env`). `sideloadly-mcp` automatically adds `.env` to `.gitignore` and uses ephemeral in-memory HTTP headers so the token is never committed or written to `.git/config`.
 
 ## Standard Workflows
 
